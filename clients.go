@@ -88,6 +88,28 @@ func (cl *Clients) Delete(id string) {
 	delete(cl.internal, id)
 }
 
+// DeleteIf removes a client from the internal map only if the map still
+// contains that exact client. It prevents a connection which is finishing its
+// cleanup from deleting a newer session that has already taken over its client
+// identity.
+func (cl *Clients) DeleteIf(id string, val *Client) bool {
+	cl.Lock()
+	defer cl.Unlock()
+	if current, ok := cl.internal[id]; !ok || current != val {
+		return false
+	}
+	delete(cl.internal, id)
+	return true
+}
+
+// IsCurrent reports whether the map still stores val for the given client id.
+func (cl *Clients) IsCurrent(id string, val *Client) bool {
+	cl.RLock()
+	defer cl.RUnlock()
+	current, ok := cl.internal[id]
+	return ok && current == val
+}
+
 // GetByListener returns clients matching a listener id.
 func (cl *Clients) GetByListener(id string) []*Client {
 	cl.RLock()
@@ -143,20 +165,21 @@ type Will struct {
 
 // ClientState tracks the state of the client.
 type ClientState struct {
-	TopicAliases    TopicAliases         // a map of topic aliases
-	stopCause       atomic.Value         // reason for stopping
-	Inflight        *Inflight            // a map of in-flight qos messages
-	Subscriptions   *Subscriptions       // a map of the subscription filters a client maintains
-	disconnected    int64                // the time the client disconnected in unix time, for calculating expiry
-	outbound        chan *packets.Packet // queue for pending outbound packets
-	endOnce         sync.Once            // only end once
-	isTakenOver     atomic.Bool          // used to identify orphaned clients
-	packetID        uint32               // the current highest packetID
-	open            context.Context      // indicate that the client is open for packet exchange
-	cancelOpen      context.CancelFunc   // cancel function for open context
-	outboundQty     int32                // number of messages currently in the outbound queue
-	Keepalive       uint16               // the number of seconds the connection can wait
-	ServerKeepalive bool                 // keepalive was set by the server
+	TopicAliases     TopicAliases         // a map of topic aliases
+	stopCause        atomic.Value         // reason for stopping
+	Inflight         *Inflight            // a map of in-flight qos messages
+	Subscriptions    *Subscriptions       // a map of the subscription filters a client maintains
+	disconnected     int64                // the time the client disconnected in unix time, for calculating expiry
+	outbound         chan *packets.Packet // queue for pending outbound packets
+	endOnce          sync.Once            // only end once
+	isTakenOver      atomic.Bool          // used to identify orphaned clients
+	admissionPending atomic.Bool          // new owner staged, but CONNACK not committed yet
+	packetID         uint32               // the current highest packetID
+	open             context.Context      // indicate that the client is open for packet exchange
+	cancelOpen       context.CancelFunc   // cancel function for open context
+	outboundQty      int32                // number of messages currently in the outbound queue
+	Keepalive        uint16               // the number of seconds the connection can wait
+	ServerKeepalive  bool                 // keepalive was set by the server
 }
 
 // newClient returns a new instance of Client. This is almost exclusively used by Server

@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -144,6 +145,18 @@ type Server struct {
 	Log          *slog.Logger         // minimal no-alloc logger
 	hooks        *Hooks               // hooks contains hooks for extra functionality such as auth and persistent storage
 	inlineClient *Client              // inlineClient is a special client used for inline subscriptions and inline Publish
+	admissionMu    sync.Mutex                // guards admissionGates and the lifetime of each per-identity gate
+	admissionGates map[string]*admissionGate // serialises admission transactions for a client identity
+}
+
+// admissionGate serialises the admission transaction of every connection
+// claiming the same client identity. Authentication, inspection of any
+// existing session, takeover, CONNACK and stopping the old connection all
+// happen while this gate is held, so a connection that fails authentication
+// can never observe or disturb a session belonging to another connection.
+type admissionGate struct {
+	sync.Mutex
+	refs int
 }
 
 // loop contains interval tickers for the system events loop.
@@ -195,6 +208,7 @@ func New(opts *Options) *Server {
 		hooks: &Hooks{
 			Log: opts.Logger,
 		},
+		admissionGates: make(map[string]*admissionGate),
 	}
 
 	if s.Options.InlineClient {
@@ -401,6 +415,120 @@ func (s *Server) EstablishConnection(listener string, c net.Conn) error {
 	return s.attachClient(cl, listener)
 }
 
+// acquireAdmission returns a release function after acquiring the admission
+// gate for a client identity. Every operation that can affect the session
+// belonging to that identity (authentication, takeover bookkeeping, CONNACK
+// and stopping the previous network connection) is performed while the gate
+// is held. Gates are reference counted and removed when the last waiter has
+// finished so that client identifiers do not accumulate forever.
+func (s *Server) acquireAdmission(id string) func() {
+	s.admissionMu.Lock()
+	if s.admissionGates == nil {
+		s.admissionGates = make(map[string]*admissionGate)
+	}
+	gate := s.admissionGates[id]
+	if gate == nil {
+		gate = new(admissionGate)
+		s.admissionGates[id] = gate
+	}
+	gate.refs++
+	s.admissionMu.Unlock()
+
+	gate.Lock()
+	return func() {
+		gate.Unlock()
+
+		s.admissionMu.Lock()
+		gate.refs--
+		if gate.refs == 0 && s.admissionGates[id] == gate {
+			delete(s.admissionGates, id)
+		}
+		s.admissionMu.Unlock()
+	}
+}
+
+// sessionShouldBeDiscarded determines whether an existing session must be abandoned
+// rather than inherited by the connecting client.
+func sessionShouldBeDiscarded(pk packets.Packet, existing *Client) bool {
+	return pk.Connect.Clean ||
+		(existing.Properties.Clean && existing.Properties.ProtocolVersion < 5) // [MQTT-3.1.2-4] [MQTT-3.1.4-4]
+}
+
+// prepareClientSession copies the resumable state of an existing session onto
+// the connecting client without changing any server-wide state. The actual
+// takeover is only committed after authentication and CONNACK have succeeded,
+// so a connection that fails at either step cannot damage the existing session.
+func (s *Server) prepareClientSession(pk packets.Packet, cl *Client, existing *Client) bool {
+	if existing == nil || sessionShouldBeDiscarded(pk, existing) {
+		return false // [MQTT-3.2.2-3]
+	}
+
+	if existing.State.Inflight.Len() > 0 {
+		cl.State.Inflight = existing.State.Inflight.Clone() // [MQTT-3.1.2-5]
+		if cl.State.Inflight.maximumReceiveQuota == 0 && cl.ops.options.Capabilities.ReceiveMaximum != 0 {
+			cl.State.Inflight.ResetReceiveQuota(int32(cl.ops.options.Capabilities.ReceiveMaximum)) // server receive max per client
+			cl.State.Inflight.ResetSendQuota(int32(cl.Properties.Props.ReceiveMaximum))            // client receive max
+		}
+	}
+
+	for _, sub := range existing.State.Subscriptions.GetAll() {
+		cl.State.Subscriptions.Add(sub.Filter, sub)
+	}
+
+	return true // [MQTT-3.2.2-3]
+}
+
+// stageClientSubscriptions registers the session's subscriptions in the topic
+// index without stopping the previous owner. It returns the subscriptions that
+// were newly added so they can be removed again if CONNACK cannot be written.
+func (s *Server) stageClientSubscriptions(cl *Client) []packets.Subscription {
+	var added []packets.Subscription
+	for _, sub := range cl.State.Subscriptions.GetAll() {
+		if s.Topics.Subscribe(cl.ID, sub) { // [MQTT-3.8.4-3]
+			atomic.AddInt64(&s.Info.Subscriptions, 1)
+			added = append(added, sub)
+		}
+	}
+	return added
+}
+
+// rollbackClientSubscriptions removes subscriptions which were staged for a
+// connection whose CONNACK did not succeed.
+func (s *Server) rollbackClientSubscriptions(cl *Client, staged []packets.Subscription) {
+	for _, sub := range staged {
+		if s.Topics.Unsubscribe(sub.Filter, cl.ID) {
+			atomic.AddInt64(&s.Info.Subscriptions, -1)
+		}
+	}
+}
+
+// commitClientSession makes the prepared session state authoritative. The old
+// client is marked as taken over before it is stopped so its cleanup goroutine
+// cannot remove or unsubscribe the session that now belongs to the new client.
+// A clean start removes the old subscriptions and inflight messages first.
+func (s *Server) commitClientSession(pk packets.Packet, cl *Client, existing *Client) {
+	if existing == nil || existing == cl {
+		return
+	}
+
+	if sessionShouldBeDiscarded(pk, existing) {
+		s.UnsubscribeClient(existing)
+		existing.ClearInflights()
+		existing.State.isTakenOver.Store(true) // only set isTakenOver after unsubscribe has occurred
+		return
+	}
+
+	existing.State.isTakenOver.Store(true)
+
+	// Clean the state of the existing client to prevent sequential take-overs
+	// from increasing memory usage by inflights + subs * client-id. Because
+	// the old client is already marked as taken over, UnsubscribeClient only
+	// clears its local state and leaves the topic index pointing at the
+	// inherited session.
+	s.UnsubscribeClient(existing)
+	existing.ClearInflights()
+}
+
 // attachClient validates an incoming client connection and if viable, attaches the client
 // to the server, performs session housekeeping, and reads incoming packets.
 func (s *Server) attachClient(cl *Client, listener string) error {
@@ -434,6 +562,21 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 		return code // [MQTT-3.2.2-7] [MQTT-3.1.4-6]
 	}
 
+	// Admission is one transaction per client identity. Authentication and
+	// the existing session lookup happen while the identity is held, so a
+	// concurrent CONNECT for the same client id cannot interleave with this
+	// one. In particular, a failed login releases the gate without touching
+	// the session that was already online.
+	release := s.acquireAdmission(cl.ID)
+	released := false
+	releaseAdmission := func() {
+		if !released {
+			released = true
+			release()
+		}
+	}
+	defer releaseAdmission()
+
 	err = s.hooks.OnConnect(cl, pk)
 	if err != nil {
 		return err
@@ -454,12 +597,49 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 
 	s.hooks.OnSessionEstablish(cl, pk)
 
-	sessionPresent := s.inheritClientSession(pk, cl)
-	s.Clients.Add(cl) // [MQTT-4.1.0-1]
+	// Bind the existing session only after authentication succeeded. Prepare
+	// the inherited state privately on the new client; no server-wide state is
+	// changed until the CONNACK has been written successfully.
+	existing, hasExisting := s.Clients.Get(cl.ID)
+	if hasExisting && existing == cl {
+		hasExisting = false
+		existing = nil
+	}
+	sessionPresent := s.prepareClientSession(pk, cl, existing)
+	stagedSubscriptions := s.stageClientSubscriptions(cl)
+
+	// Stage the new owner before writing CONNACK so a caller that observes the
+	// CONNACK can immediately observe the new session through Clients.Get.
+	// Publications are suppressed until the CONNACK has been written (see
+	// publishToClient), and the map is rolled back if the write fails.
+	cl.State.admissionPending.Store(true)
+	s.Clients.Add(cl)
 
 	err = s.SendConnack(cl, code, sessionPresent, nil) // [MQTT-3.1.4-5] [MQTT-3.2.0-1] [MQTT-3.2.0-2] &[MQTT-3.14.0-1]
 	if err != nil {
+		// The transaction was never committed. Restore the previous owner and
+		// leave its connection, subscriptions and inflight state untouched.
+		if hasExisting {
+			s.Clients.Add(existing)
+		} else {
+			s.Clients.DeleteIf(cl.ID, cl)
+		}
+		s.rollbackClientSubscriptions(cl, stagedSubscriptions)
+		cl.State.admissionPending.Store(false)
 		return fmt.Errorf("ack connection packet: %w", err)
+	}
+	cl.State.admissionPending.Store(false)
+
+	// CONNACK succeeded: publish the new session and only then retire the old
+	// connection. The old client is marked as taken over before it is stopped,
+	// preventing its cleanup path from deleting the new owner of the identity.
+	s.commitClientSession(pk, cl, existing)
+	s.Clients.Add(cl) // [MQTT-4.1.0-1]
+	if existing == nil && atomic.LoadInt64(&s.Info.ClientsConnected) > atomic.LoadInt64(&s.Info.ClientsMaximum) {
+		atomic.AddInt64(&s.Info.ClientsMaximum, 1)
+	}
+	if hasExisting {
+		_ = s.DisconnectClient(existing, packets.ErrSessionTakenOver) // [MQTT-3.1.4-3]
 	}
 
 	s.loop.willDelayed.Delete(cl.ID) // [MQTT-3.1.3-9]
@@ -472,6 +652,7 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 	}
 
 	s.hooks.OnSessionEstablished(cl, pk)
+	releaseAdmission()
 
 	err = cl.Read(s.receivePacket)
 	if err != nil {
@@ -486,9 +667,17 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 	s.hooks.OnDisconnect(cl, err, expire)
 
 	if expire && !cl.IsTakenOver() {
-		cl.ClearInflights()
-		s.UnsubscribeClient(cl)
-		s.Clients.Delete(cl.ID) // [MQTT-4.1.0-2] ![MQTT-3.1.2-23]
+		// Expiring a session participates in the same identity transaction as
+		// a new CONNECT. If a takeover is in progress, the old cleanup waits
+		// until it has either committed or aborted, and then sees that it is
+		// no longer the current owner.
+		release := s.acquireAdmission(cl.ID)
+		if s.Clients.IsCurrent(cl.ID, cl) {
+			cl.ClearInflights()
+			s.UnsubscribeClient(cl)
+			s.Clients.DeleteIf(cl.ID, cl) // [MQTT-4.1.0-2] ![MQTT-3.1.2-23]
+		}
+		release()
 	}
 
 	return err
@@ -1022,6 +1211,13 @@ func (s *Server) publishToSubscribers(pk packets.Packet) {
 }
 
 func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packets.Packet) (packets.Packet, error) {
+	if cl.State.admissionPending.Load() {
+		// The new connection is staged while its CONNACK is in flight. It is
+		// visible through Clients.Get so observers see one owner, but it must
+		// not receive PUBLISH packets before its CONNACK.
+		return pk, nil
+	}
+
 	if sub.NoLocal && pk.Origin == cl.ID {
 		return pk, nil // [MQTT-3.8.3-3]
 	}
@@ -1708,7 +1904,7 @@ func (s *Server) clearExpiredClients(dt int64) {
 
 		if disconnected+int64(expire) < dt {
 			s.hooks.OnClientExpired(client)
-			s.Clients.Delete(id) // [MQTT-4.1.0-2]
+			s.Clients.DeleteIf(id, client) // [MQTT-4.1.0-2]
 		}
 	}
 }
