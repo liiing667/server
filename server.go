@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -144,6 +145,8 @@ type Server struct {
 	Log          *slog.Logger         // minimal no-alloc logger
 	hooks        *Hooks               // hooks contains hooks for extra functionality such as auth and persistent storage
 	inlineClient *Client              // inlineClient is a special client used for inline subscriptions and inline Publish
+	admissionMu  sync.Mutex           // guards admission and release of client capacity
+	admitted     int64                // clients admitted across every listener domain, including the inline client
 }
 
 // loop contains interval tickers for the system events loop.
@@ -199,7 +202,12 @@ func New(opts *Options) *Server {
 
 	if s.Options.InlineClient {
 		s.inlineClient = s.NewClient(nil, LocalListener, InlineClientId, true)
-		s.Clients.Add(s.inlineClient)
+		if s.admitClient() {
+			s.Clients.Add(s.inlineClient)
+		} else {
+			s.Log.Warn("inline client not admitted", "error", packets.ErrServerBusy)
+			s.inlineClient = nil
+		}
 	}
 
 	return s
@@ -252,6 +260,14 @@ func (s *Server) NewClient(c net.Conn, listener string, id string, inline bool) 
 
 	if inline { // inline clients bypass acl and some validity checks.
 		cl.Net.Inline = true
+		if cl.Net.Listener == "" {
+			cl.Net.Listener = LocalListener
+		}
+		if cl.Net.Remote == "" {
+			// The inline client has no network peer, but it still has a
+			// transport identity within its listener domain.
+			cl.Net.Remote = cl.Net.Listener
+		}
 		// By default, we don't want to restrict developer publishes,
 		// but if you do, reset this after creating inline client.
 		cl.State.Inflight.ResetReceiveQuota(math.MaxInt32)
@@ -401,6 +417,30 @@ func (s *Server) EstablishConnection(listener string, c net.Conn) error {
 	return s.attachClient(cl, listener)
 }
 
+// admitClient reserves one client slot in the server-wide capacity. The same
+// reservation is used by every entry point (each network listener and the
+// inline client), so they cannot reach different conclusions about
+// MaximumClients.
+func (s *Server) admitClient() bool {
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
+	if s.admitted >= s.Options.Capabilities.MaximumClients ||
+		atomic.LoadInt64(&s.Info.ClientsConnected) >= s.Options.Capabilities.MaximumClients {
+		return false
+	}
+	s.admitted++
+	return true
+}
+
+// releaseAdmittedClient returns a previously reserved client slot.
+func (s *Server) releaseAdmittedClient() {
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
+	if s.admitted > 0 {
+		s.admitted--
+	}
+}
+
 // attachClient validates an incoming client connection and if viable, attaches the client
 // to the server, performs session housekeeping, and reads incoming packets.
 func (s *Server) attachClient(cl *Client, listener string) error {
@@ -416,7 +456,7 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 	}
 
 	cl.ParseConnect(listener, pk)
-	if atomic.LoadInt64(&s.Info.ClientsConnected) >= s.Options.Capabilities.MaximumClients {
+	if !s.admitClient() {
 		if cl.Properties.ProtocolVersion < 5 {
 			s.SendConnack(cl, packets.ErrServerUnavailable, false, nil)
 		} else {
@@ -425,6 +465,7 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 
 		return packets.ErrServerBusy
 	}
+	defer s.releaseAdmittedClient()
 
 	code := s.validateConnect(cl, pk) // [MQTT-3.1.4-1] [MQTT-3.1.4-2]
 	if code != packets.CodeSuccess {
@@ -462,7 +503,7 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 		return fmt.Errorf("ack connection packet: %w", err)
 	}
 
-	s.loop.willDelayed.Delete(cl.ID) // [MQTT-3.1.3-9]
+	s.loop.willDelayed.Delete(cl.Key()) // [MQTT-3.1.3-9]
 
 	if sessionPresent {
 		err = cl.ResendInflightMessages(true)
@@ -488,7 +529,7 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 	if expire && !cl.IsTakenOver() {
 		cl.ClearInflights()
 		s.UnsubscribeClient(cl)
-		s.Clients.Delete(cl.ID) // [MQTT-4.1.0-2] ![MQTT-3.1.2-23]
+		s.Clients.DeleteByDomain(cl.Net.Listener, cl.ID) // [MQTT-4.1.0-2] ![MQTT-3.1.2-23]
 	}
 
 	return err
@@ -560,7 +601,7 @@ func (s *Server) validateConnect(cl *Client, pk packets.Packet) packets.Code {
 // connection ID. If clean is true, the state of any previously existing client
 // session is abandoned.
 func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
-	if existing, ok := s.Clients.Get(cl.ID); ok {
+	if existing, ok := s.Clients.GetByDomain(cl.Net.Listener, cl.ID); ok {
 		_ = s.DisconnectClient(existing, packets.ErrSessionTakenOver)                                   // [MQTT-3.1.4-3]
 		if pk.Connect.Clean || (existing.Properties.Clean && existing.Properties.ProtocolVersion < 5) { // [MQTT-3.1.2-4] [MQTT-3.1.4-4]
 			s.UnsubscribeClient(existing)
@@ -579,7 +620,7 @@ func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
 		}
 
 		for _, sub := range existing.State.Subscriptions.GetAll() {
-			existed := !s.Topics.Subscribe(cl.ID, sub) // [MQTT-3.8.4-3]
+			existed := !s.Topics.Subscribe(cl.Key(), sub) // [MQTT-3.8.4-3]
 			if !existed {
 				atomic.AddInt64(&s.Info.Subscriptions, 1)
 			}
@@ -751,7 +792,7 @@ func (s *Server) processPingreq(cl *Client, _ packets.Packet) error {
 // to any topic (including $SYS) and bypass ACL checks. The qos byte is used for limiting the
 // outbound qos (mqtt v5) rather than issuing to the broker (we assume qos 2 complete).
 func (s *Server) Publish(topic string, payload []byte, retain bool, qos byte) error {
-	if !s.Options.InlineClient {
+	if !s.Options.InlineClient || s.inlineClient == nil {
 		return ErrInlineClientNotEnabled
 	}
 
@@ -770,7 +811,7 @@ func (s *Server) Publish(topic string, payload []byte, retain bool, qos byte) er
 // Subscribe adds an inline subscription for the specified topic filter and subscription identifier
 // with the provided handler function.
 func (s *Server) Subscribe(filter string, subscriptionId int, handler InlineSubFn) error {
-	if !s.Options.InlineClient {
+	if !s.Options.InlineClient || s.inlineClient == nil {
 		return ErrInlineClientNotEnabled
 	}
 
@@ -812,7 +853,7 @@ func (s *Server) Subscribe(filter string, subscriptionId int, handler InlineSubF
 // It allows you to unsubscribe a specific subscription from the internal subscription
 // associated with the given topic filter.
 func (s *Server) Unsubscribe(filter string, subscriptionId int) error {
-	if !s.Options.InlineClient {
+	if !s.Options.InlineClient || s.inlineClient == nil {
 		return ErrInlineClientNotEnabled
 	}
 
@@ -883,6 +924,7 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 	}
 
 	pk.Origin = cl.ID
+	pk.OriginKey = cl.Key()
 	pk.Created = time.Now().Unix()
 
 	if expiry := minimum(s.Options.Capabilities.MaximumMessageExpiryInterval,
@@ -1012,7 +1054,7 @@ func (s *Server) publishToSubscribers(pk packets.Packet) {
 	}
 
 	for id, subs := range subscribers.Subscriptions {
-		if cl, ok := s.Clients.Get(id); ok {
+		if cl, ok := s.Clients.GetByKey(id); ok {
 			_, err := s.publishToClient(cl, subs, pk)
 			if err != nil {
 				s.Log.Debug("failed publishing packet", "error", err, "client", cl.ID, "packet", pk)
@@ -1022,7 +1064,11 @@ func (s *Server) publishToSubscribers(pk packets.Packet) {
 }
 
 func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packets.Packet) (packets.Packet, error) {
-	if sub.NoLocal && pk.Origin == cl.ID {
+	origin := pk.OriginKey
+	if origin == "" {
+		origin = pk.Origin
+	}
+	if sub.NoLocal && (origin == cl.Key() || (pk.OriginKey == "" && pk.Origin == cl.ID)) {
 		return pk, nil // [MQTT-3.8.3-3]
 	}
 
@@ -1261,7 +1307,7 @@ func (s *Server) processSubscribe(cl *Client, pk packets.Packet) error {
 				reasonCodes[i] = packets.ErrUnspecifiedError.Code
 			}
 		} else {
-			isNew := s.Topics.Subscribe(cl.ID, sub) // [MQTT-3.8.4-3]
+			isNew := s.Topics.Subscribe(cl.Key(), sub) // [MQTT-3.8.4-3]
 			if isNew {
 				atomic.AddInt64(&s.Info.Subscriptions, 1)
 			}
@@ -1327,7 +1373,7 @@ func (s *Server) processUnsubscribe(cl *Client, pk packets.Packet) error {
 			continue
 		}
 
-		if q := s.Topics.Unsubscribe(sub.Filter, cl.ID); q {
+		if q := s.Topics.Unsubscribe(sub.Filter, cl.Key()); q {
 			atomic.AddInt64(&s.Info.Subscriptions, -1)
 			reasonCodes[i] = packets.CodeSuccess.Code
 		} else {
@@ -1370,7 +1416,7 @@ func (s *Server) UnsubscribeClient(cl *Client) {
 	}
 
 	for k, v := range filterMap {
-		if s.Topics.Unsubscribe(k, cl.ID) {
+		if s.Topics.Unsubscribe(k, cl.Key()) {
 			atomic.AddInt64(&s.Info.Subscriptions, -1)
 		}
 		filters[i] = v
@@ -1404,7 +1450,7 @@ func (s *Server) processDisconnect(cl *Client, pk packets.Packet) error {
 		return packets.CodeDisconnectWillMessage
 	}
 
-	s.loop.willDelayed.Delete(cl.ID) // [MQTT-3.1.3-9] [MQTT-3.1.2-8]
+	s.loop.willDelayed.Delete(cl.Key()) // [MQTT-3.1.3-9] [MQTT-3.1.2-8]
 	cl.Stop(packets.CodeDisconnect)  // [MQTT-3.14.4-2]
 
 	return nil
@@ -1531,14 +1577,15 @@ func (s *Server) sendLWT(cl *Client) {
 		Properties: packets.Properties{
 			User: modifiedLWT.User,
 		},
-		Origin:  cl.ID,
+		Origin:    cl.ID,
+		OriginKey: cl.Key(),
 		Created: time.Now().Unix(),
 	}
 
 	if cl.Properties.Will.WillDelayInterval > 0 {
 		pk.Connect.WillProperties.WillDelayInterval = cl.Properties.Will.WillDelayInterval
 		pk.Expiry = time.Now().Unix() + int64(pk.Connect.WillProperties.WillDelayInterval)
-		s.loop.willDelayed.Add(cl.ID, pk)
+		s.loop.willDelayed.Add(cl.Key(), pk)
 		return
 	}
 
@@ -1632,8 +1679,8 @@ func (s *Server) loadSubscriptions(v []storage.Subscription) {
 			NoLocal:           sub.NoLocal,
 			Identifier:        sub.Identifier,
 		}
-		if s.Topics.Subscribe(sub.Client, sb) {
-			if cl, ok := s.Clients.Get(sub.Client); ok {
+		if cl, ok := s.Clients.Get(sub.Client); ok {
+			if s.Topics.Subscribe(cl.Key(), sb) {
 				cl.State.Subscriptions.Add(sub.Filter, sb)
 			}
 		}
@@ -1644,6 +1691,7 @@ func (s *Server) loadSubscriptions(v []storage.Subscription) {
 func (s *Server) loadClients(v []storage.Client) {
 	for _, c := range v {
 		cl := s.NewClient(nil, c.Listener, c.ID, false)
+		cl.Net.Remote = c.Remote
 		cl.Properties.Username = c.Username
 		cl.Properties.Clean = c.Clean
 		cl.Properties.ProtocolVersion = c.ProtocolVersion
@@ -1746,7 +1794,7 @@ func (s *Server) sendDelayedLWT(dt int64) {
 	for id, pk := range s.loop.willDelayed.GetAll() {
 		if dt > pk.Expiry {
 			s.publishToSubscribers(pk) // [MQTT-3.1.2-8]
-			if cl, ok := s.Clients.Get(id); ok {
+			if cl, ok := s.Clients.GetByKey(id); ok {
 				if pk.FixedHeader.Retain {
 					s.retainMessage(cl, pk)
 				}

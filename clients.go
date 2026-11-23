@@ -36,7 +36,9 @@ type ReadFn func(*Client, packets.Packet) error
 
 // Clients contains a map of the clients known by the broker.
 type Clients struct {
-	internal map[string]*Client // clients known by the broker, keyed on client id.
+	internal map[string]*Client            // clients known by the broker, keyed for compatibility on client id where possible.
+	byKey    map[string]*Client            // clients keyed on their listener domain and client id.
+	byID     map[string]map[string]*Client // clients keyed on client id, then listener domain.
 	sync.RWMutex
 }
 
@@ -44,14 +46,86 @@ type Clients struct {
 func NewClients() *Clients {
 	return &Clients{
 		internal: make(map[string]*Client),
+		byKey:    make(map[string]*Client),
+		byID:     make(map[string]map[string]*Client),
+	}
+}
+
+// clientDomainKey returns the identity of a client within a listener domain.
+// A client with no listener keeps its bare id so that callers which construct
+// clients by hand continue to address them exactly as before.
+func clientDomainKey(listener, id string) string {
+	if listener == "" {
+		return id
+	}
+	return listener + "\x00" + id
+}
+
+// Domain returns the listener domain the client belongs to.
+func (cl *Client) Domain() string {
+	if cl == nil {
+		return ""
+	}
+	return cl.Net.Listener
+}
+
+// Key returns the client's identity within its listener domain. It is stable
+// for the lifetime of the client, whether or not another listener happens to
+// have a client with the same client id.
+func (cl *Client) Key() string {
+	if cl == nil {
+		return ""
+	}
+	return clientDomainKey(cl.Net.Listener, cl.ID)
+}
+
+// reindexLocked rebuilds the compatibility index for a client id. A single
+// client remains keyed on its bare id; once the same id exists in more than
+// one listener domain every client is keyed on its domain-qualified key.
+func (cl *Clients) reindexLocked(id string) {
+	for key, client := range cl.internal {
+		if client.ID == id {
+			delete(cl.internal, key)
+		}
+	}
+
+	peers := cl.byID[id]
+	switch len(peers) {
+	case 0:
+		return
+	case 1:
+		for _, client := range peers {
+			cl.internal[client.ID] = client
+		}
+	default:
+		for domain, client := range peers {
+			cl.internal[clientDomainKey(domain, id)] = client
+		}
 	}
 }
 
 // Add adds a new client to the clients map, keyed on client id.
 func (cl *Clients) Add(val *Client) {
+	if val == nil {
+		return
+	}
+
 	cl.Lock()
 	defer cl.Unlock()
-	cl.internal[val.ID] = val
+
+	peers, ok := cl.byID[val.ID]
+	if !ok {
+		peers = map[string]*Client{}
+		cl.byID[val.ID] = peers
+	}
+
+	if existing, ok := peers[val.Net.Listener]; ok {
+		delete(cl.byKey, existing.Key())
+	}
+
+	peers[val.Net.Listener] = val
+	cl.byKey[val.Key()] = val
+	cl.reindexLocked(val.ID)
 }
 
 // GetAll returns all the clients.
@@ -69,7 +143,60 @@ func (cl *Clients) GetAll() map[string]*Client {
 func (cl *Clients) Get(id string) (*Client, bool) {
 	cl.RLock()
 	defer cl.RUnlock()
-	val, ok := cl.internal[id]
+
+	if val, ok := cl.byKey[id]; ok {
+		return val, true
+	}
+	if val, ok := cl.internal[id]; ok {
+		return val, true
+	}
+
+	// The bare id is ambiguous when more than one listener domain owns a
+	// client with that id. Return a deterministic one for compatibility;
+	// callers which need a particular listener use GetByDomain.
+	peers, ok := cl.byID[id]
+	if !ok || len(peers) == 0 {
+		return nil, false
+	}
+
+	var (
+		bestDomain    string
+		best          *Client
+		bestConnected bool
+	)
+	for domain, client := range peers {
+		connected := !client.Closed()
+		if best == nil ||
+			(connected && !bestConnected) ||
+			(connected == bestConnected && domain < bestDomain) {
+			bestDomain = domain
+			best = client
+			bestConnected = connected
+		}
+	}
+	return best, true
+}
+
+// GetByKey returns the client with the given domain-qualified key.
+func (cl *Clients) GetByKey(key string) (*Client, bool) {
+	cl.RLock()
+	defer cl.RUnlock()
+	if val, ok := cl.byKey[key]; ok {
+		return val, true
+	}
+	val, ok := cl.internal[key]
+	return val, ok
+}
+
+// GetByDomain returns the client with the given client id on a listener.
+func (cl *Clients) GetByDomain(listener, id string) (*Client, bool) {
+	cl.RLock()
+	defer cl.RUnlock()
+	peers, ok := cl.byID[id]
+	if !ok {
+		return nil, false
+	}
+	val, ok := peers[listener]
 	return val, ok
 }
 
@@ -82,18 +209,70 @@ func (cl *Clients) Len() int {
 }
 
 // Delete removes a client from the internal map.
-func (cl *Clients) Delete(id string) {
+func (cl *Clients) Delete(key string) {
 	cl.Lock()
 	defer cl.Unlock()
-	delete(cl.internal, id)
+	cl.deleteLocked(key)
+}
+
+// DeleteByDomain removes a client with the given client id from a listener.
+func (cl *Clients) DeleteByDomain(listener, id string) {
+	cl.Lock()
+	defer cl.Unlock()
+
+	peers, ok := cl.byID[id]
+	if !ok {
+		return
+	}
+	if client, ok := peers[listener]; ok {
+		cl.deleteClientLocked(client)
+	}
+}
+
+func (cl *Clients) deleteLocked(key string) {
+	client, ok := cl.byKey[key]
+	if !ok {
+		client, ok = cl.internal[key]
+	}
+	if !ok {
+		peers := cl.byID[key]
+		if len(peers) == 0 {
+			return
+		}
+		var (
+			bestDomain string
+			best       *Client
+		)
+		for domain, peer := range peers {
+			if best == nil || domain < bestDomain {
+				bestDomain = domain
+				best = peer
+			}
+		}
+		client = best
+	}
+	cl.deleteClientLocked(client)
+}
+
+func (cl *Clients) deleteClientLocked(client *Client) {
+	delete(cl.byKey, client.Key())
+	if peers, ok := cl.byID[client.ID]; ok {
+		if peers[client.Net.Listener] == client {
+			delete(peers, client.Net.Listener)
+		}
+		if len(peers) == 0 {
+			delete(cl.byID, client.ID)
+		}
+	}
+	cl.reindexLocked(client.ID)
 }
 
 // GetByListener returns clients matching a listener id.
 func (cl *Clients) GetByListener(id string) []*Client {
 	cl.RLock()
 	defer cl.RUnlock()
-	clients := make([]*Client, 0, cl.Len())
-	for _, client := range cl.internal {
+	clients := make([]*Client, 0, len(cl.byKey))
+	for _, client := range cl.byKey {
 		if client.Net.Listener == id && !client.Closed() {
 			clients = append(clients, client)
 		}
@@ -180,10 +359,14 @@ func newClient(c net.Conn, o *ops) *Client {
 	}
 
 	if c != nil {
+		remote := ""
+		if addr := c.RemoteAddr(); addr != nil {
+			remote = addr.String()
+		}
 		cl.Net = ClientConnection{
 			Conn:   c,
 			bconn:  bufio.NewReaderSize(c, o.options.ClientNetReadBufferSize),
-			Remote: c.RemoteAddr().String(),
+			Remote: remote,
 		}
 	}
 

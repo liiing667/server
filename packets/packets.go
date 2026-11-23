@@ -128,6 +128,7 @@ type Packet struct {
 	Filters         Subscriptions // a list of subscription filters and their properties (subscribe, unsubscribe)
 	TopicName       string        // the topic a payload is being published to
 	Origin          string        // client id of the client who is issuing the packet (mostly internal use)
+	OriginKey       string        // domain-qualified identity of the client issuing the packet (mostly internal use)
 	FixedHeader     FixedHeader   // -
 	Created         int64         // unix timestamp indicating time packet was created/received on the server
 	Expiry          int64         // unix timestamp indicating when the packet will expire and should be deleted
@@ -214,6 +215,7 @@ func (pk *Packet) Copy(allowTransfer bool) Packet {
 		Created:        pk.Created,
 		Expiry:         pk.Expiry,
 		Origin:         pk.Origin,
+		OriginKey:      pk.OriginKey,
 	}
 
 	if allowTransfer {
