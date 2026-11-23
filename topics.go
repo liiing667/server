@@ -63,6 +63,24 @@ func (a *InboundTopicAliases) Set(id uint16, topic string) string {
 	return topic
 }
 
+// Get returns the topic registered for the given alias id without mutating
+// any alias state. If the alias is unknown, ok is false.
+func (a *InboundTopicAliases) Get(id uint16) (topic string, ok bool) {
+	a.RLock()
+	defer a.RUnlock()
+	topic, ok = a.internal[id]
+	return
+}
+
+// Reset discards every registered inbound alias. Topic aliases are scoped to a
+// single network connection [MQTT-3.1.2-27] and must not survive a reconnect,
+// even when the client session itself is resumed.
+func (a *InboundTopicAliases) Reset() {
+	a.Lock()
+	defer a.Unlock()
+	a.internal = map[uint16]string{}
+}
+
 // OutboundTopicAliases contains a map of topic aliases sent from the broker to the client.
 type OutboundTopicAliases struct {
 	internal map[string]uint16

@@ -184,6 +184,34 @@ func TestClientParseConnect(t *testing.T) {
 	require.Equal(t, int32(pk.Properties.ReceiveMaximum), cl.State.Inflight.maximumSendQuota)
 }
 
+func TestClientParseConnectResetsInboundTopicAliases(t *testing.T) {
+	cl, _, _ := newTestClient()
+
+	// Simulate aliases registered on a previous connection.
+	cl.State.TopicAliases.Inbound.Set(1, "a/b/c")
+	cl.State.TopicAliases.Inbound.Set(2, "d/e/f")
+
+	pk := packets.Packet{
+		ProtocolVersion: 5,
+		Connect: packets.ConnectParams{
+			ProtocolName:     []byte{'M', 'Q', 'T', 'T'},
+			Clean:            false,
+			Keepalive:        60,
+			ClientIdentifier: "mochi",
+		},
+	}
+
+	cl.ParseConnect("tcp1", pk)
+
+	// [MQTT-3.1.2-27] topic aliases are scoped to a single connection and must
+	// not survive a reconnect, even when the session is resumed.
+	_, ok := cl.State.TopicAliases.Inbound.Get(1)
+	require.False(t, ok)
+	_, ok = cl.State.TopicAliases.Inbound.Get(2)
+	require.False(t, ok)
+	require.Empty(t, cl.State.TopicAliases.Inbound.internal)
+}
+
 func TestClientParseConnectReceiveMaxExceedMaxInflight(t *testing.T) {
 	const MaxInflight uint16 = 1
 	cl, _, _ := newTestClient()

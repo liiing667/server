@@ -800,6 +800,43 @@ func TestInboundAliasesSet(t *testing.T) {
 	require.Equal(t, topic, a.Set(id, ""))
 }
 
+func TestInboundAliasesGet(t *testing.T) {
+	a := NewInboundTopicAliases(5)
+
+	// An unknown alias must report miss without registering anything.
+	topic, ok := a.Get(1)
+	require.False(t, ok)
+	require.Empty(t, topic)
+	require.Empty(t, a.internal)
+
+	a.Set(1, "a/b/c")
+	topic, ok = a.Get(1)
+	require.True(t, ok)
+	require.Equal(t, "a/b/c", topic)
+
+	// Get must never mutate the alias map.
+	require.Equal(t, "a/b/c", a.internal[uint16(1)])
+}
+
+func TestInboundAliasesReset(t *testing.T) {
+	a := NewInboundTopicAliases(5)
+	a.Set(1, "a/b/c")
+	a.Set(2, "d/e/f")
+	require.Len(t, a.internal, 2)
+
+	a.Reset()
+	require.Empty(t, a.internal)
+
+	_, ok := a.Get(1)
+	require.False(t, ok)
+
+	// The map remains usable after a reset.
+	a.Set(3, "g/h/i")
+	topic, ok := a.Get(3)
+	require.True(t, ok)
+	require.Equal(t, "g/h/i", topic)
+}
+
 func TestInboundAliasesSetMaxZero(t *testing.T) {
 	topic := "test"
 	id := uint16(1)

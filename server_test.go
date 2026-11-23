@@ -2255,6 +2255,367 @@ func TestProcessPublishWithTopicAlias(t *testing.T) {
 	require.Equal(t, packets.TPacketData[packets.Publish].Get(packets.TPublishBasic).RawBytes, buf)
 }
 
+// ruleACLHook allows write access only to topics matching allowedWriteTopics and
+// records every (topic, write) pair the ACL was evaluated against.
+type ruleACLHook struct {
+	HookBase
+	allowedWriteTopics map[string]bool
+	allowAllReads      bool
+	checks             []aclCheck
+}
+
+type aclCheck struct {
+	topic string
+	write bool
+}
+
+func (h *ruleACLHook) ID() string { return "rule-acl" }
+
+func (h *ruleACLHook) Provides(b byte) bool {
+	return bytes.Contains([]byte{OnACLCheck}, []byte{b})
+}
+
+func (h *ruleACLHook) OnACLCheck(_ *Client, topic string, write bool) bool {
+	h.checks = append(h.checks, aclCheck{topic: topic, write: write})
+	if !write {
+		return h.allowAllReads
+	}
+	return h.allowedWriteTopics[topic]
+}
+
+// newRuleACLServer returns a server without the default AllowHook so the
+// provided ruleACLHook is the sole authority for ACL decisions.
+func newRuleACLServer(hook *ruleACLHook) *Server {
+	cc := NewDefaultServerCapabilities()
+	cc.MaximumMessageExpiryInterval = 0
+	cc.ReceiveMaximum = 0
+	s := New(&Options{
+		Logger:       logger,
+		Capabilities: cc,
+	})
+	_ = s.AddHook(hook, nil)
+	return s
+}
+
+// TestProcessPublishTopicAliasACLResolution proves that the write ACL check is
+// always evaluated against the real topic resolved from the inbound alias, never
+// against the alias string or an empty topic name.
+func TestProcessPublishTopicAliasACLResolution(t *testing.T) {
+	hook := &ruleACLHook{
+		allowedWriteTopics: map[string]bool{"allowed/topic": true},
+		allowAllReads:      true,
+	}
+	s := newRuleACLServer(hook)
+
+	// Subscriber receives whatever is legitimately published to denied/topic.
+	sub, r, w := newTestClient()
+	sub.ID = "acl-resolution-subscriber"
+	sub.Properties.ProtocolVersion = 5
+	s.Clients.Add(sub)
+	require.True(t, s.Topics.Subscribe(sub.ID, packets.Subscription{Filter: "denied/topic", Qos: 0}))
+
+	pub, _, pubW := newTestClient()
+	pub.ID = "acl-resolution-publisher"
+	pub.Properties.ProtocolVersion = 5
+	s.Clients.Add(pub)
+
+	const aliasID uint16 = 7
+
+	// 1. Register the alias with an allowed topic first (legal MQTT5 flow).
+	register := packets.Packet{
+		ProtocolVersion: 5,
+		FixedHeader:     packets.FixedHeader{Type: packets.Publish, Qos: 0},
+		TopicName:       "allowed/topic",
+		Properties: packets.Properties{
+			TopicAlias:     aliasID,
+			TopicAliasFlag: true,
+		},
+		Payload: []byte("register"),
+	}
+	require.NoError(t, s.processPublish(pub, register))
+
+	registered, ok := pub.State.TopicAliases.Inbound.Get(aliasID)
+	require.True(t, ok)
+	require.Equal(t, "allowed/topic", registered)
+	t.Logf("alias=%d registered, final topic=%q", aliasID, registered)
+
+	// 2. Re-bind the same alias to a denied topic: the write ACL must be
+	// evaluated against the real topic "denied/topic" and reject the publish.
+	rebind := packets.Packet{
+		ProtocolVersion: 5,
+		FixedHeader:     packets.FixedHeader{Type: packets.Publish, Qos: 0},
+		TopicName:       "denied/topic",
+		Properties: packets.Properties{
+			TopicAlias:     aliasID,
+			TopicAliasFlag: true,
+		},
+		Payload: []byte("rebind"),
+	}
+	require.NoError(t, s.processPublish(pub, rebind)) // qos0 denial is silent
+
+	// The alias mapping must not have been updated by the rejected publish.
+	registered, ok = pub.State.TopicAliases.Inbound.Get(aliasID)
+	require.True(t, ok)
+	require.Equal(t, "allowed/topic", registered)
+	t.Logf("after denied rebind, alias=%d still maps to final topic=%q", aliasID, registered)
+
+	// 3. Publish with an empty topic name reusing the alias: it must resolve to
+	// the still-registered (allowed) topic, never to the denied one.
+	empty := packets.Packet{
+		ProtocolVersion: 5,
+		FixedHeader:     packets.FixedHeader{Type: packets.Publish, Qos: 0},
+		TopicName:       "",
+		Properties: packets.Properties{
+			TopicAlias:     aliasID,
+			TopicAliasFlag: true,
+		},
+		Payload: []byte("via-alias"),
+	}
+	require.NoError(t, s.processPublish(pub, empty))
+
+	var writeChecks []string
+	for _, c := range hook.checks {
+		if c.write {
+			writeChecks = append(writeChecks, c.topic)
+		}
+	}
+	require.Equal(t, []string{"allowed/topic", "denied/topic", "allowed/topic"}, writeChecks)
+	t.Logf("write ACL topics evaluated: %v (alias=%d, final topic resolved server-side)", writeChecks, aliasID)
+
+	// The subscriber on denied/topic must never have received a message.
+	_ = w.Close()
+	buf, err := io.ReadAll(r)
+	require.NoError(t, err)
+	require.Empty(t, buf)
+	_ = pubW.Close()
+}
+
+// TestProcessPublishTopicAliasDenialDoesNotRegister ensures a denied
+// first-time alias registration leaves no alias state behind and delivers
+// nothing, for qos0 (silent drop), qos1 (PUBACK 0x87) and qos2 (PUBREC 0x87).
+func TestProcessPublishTopicAliasDenialDoesNotRegister(t *testing.T) {
+	tt := []struct {
+		name     string
+		qos      byte
+		packetID uint16
+		wantErr  error
+		wantAck  bool
+	}{
+		{
+			name:    "qos0_silent_drop",
+			qos:     0,
+			wantErr: nil,
+		},
+		{
+			name:     "qos1_not_authorized_puback",
+			qos:      1,
+			packetID: 7,
+			wantErr:  nil,
+			wantAck:  true,
+		},
+		{
+			name:     "qos2_not_authorized_pubrec",
+			qos:      2,
+			packetID: 7,
+			wantErr:  nil,
+			wantAck:  true,
+		},
+	}
+
+	for _, tx := range tt {
+		t.Run(tx.name, func(t *testing.T) {
+			hook := &ruleACLHook{
+				allowedWriteTopics: map[string]bool{}, // deny every write
+				allowAllReads:      true,
+			}
+			s := newRuleACLServer(hook)
+
+			sub, r, subW := newTestClient()
+			sub.ID = "denial-subscriber"
+			s.Clients.Add(sub)
+			require.True(t, s.Topics.Subscribe(sub.ID, packets.Subscription{Filter: "secret", Qos: 0}))
+
+			pub, pr, pubW := newTestClient()
+			pub.ID = "denial-publisher"
+			pub.Properties.ProtocolVersion = 5
+			s.Clients.Add(pub)
+
+			pk := packets.Packet{
+				ProtocolVersion: 5,
+				FixedHeader:     packets.FixedHeader{Type: packets.Publish, Qos: tx.qos},
+				PacketID:        tx.packetID,
+				TopicName:       "secret",
+				Properties: packets.Properties{
+					TopicAlias:     3,
+					TopicAliasFlag: true,
+				},
+				Payload: []byte("payload"),
+			}
+
+			pubAck := make(chan []byte, 1)
+			if tx.wantAck {
+				go func() {
+					b, readErr := io.ReadAll(pr)
+					require.NoError(t, readErr)
+					pubAck <- b
+				}()
+			}
+			// Reusing the unknown alias with an empty topic is a protocol error
+			// and never produces an ack, so run it before closing the publisher.
+			unknown := pk
+			unknown.TopicName = ""
+
+			err := s.processPublish(pub, pk)
+			if tx.wantErr != nil {
+				require.ErrorIs(t, err, tx.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+
+			// The denied publish must not have registered the alias at all.
+			_, ok := pub.State.TopicAliases.Inbound.Get(3)
+			require.False(t, ok)
+			t.Logf("denied publish: alias=%d not registered, intended final topic=%q", 3, "secret")
+
+			require.ErrorIs(t, s.processPublish(pub, unknown), packets.ErrTopicAliasInvalid)
+
+			// Closing the publisher unblocks io.ReadAll in the reader goroutine.
+			_ = pubW.Close()
+
+			if tx.wantAck {
+				ackType := packets.Puback
+				encodeAck := (*packets.Packet).PubackEncode
+				if tx.qos == 2 {
+					ackType = packets.Pubrec
+					encodeAck = (*packets.Packet).PubrecEncode
+				}
+				wantAckPk := s.buildAck(tx.packetID, ackType, 0, pk.Properties, packets.ErrNotAuthorized)
+				wantAckPk.ProtocolVersion = 5
+				var wantAckBuf bytes.Buffer
+				require.NoError(t, encodeAck(&wantAckPk, &wantAckBuf))
+				require.Equal(t, wantAckBuf.Bytes(), <-pubAck)
+			}
+
+			// Nothing must have been delivered to the subscriber.
+			_ = subW.Close()
+			buf, readErr := io.ReadAll(r)
+			require.NoError(t, readErr)
+			require.Empty(t, buf)
+		})
+	}
+}
+
+// TestProcessPublishTopicAliasUnknownAliasEmptyTopic proves that referencing an
+// unregistered alias with a zero-length topic name fails instead of being
+// authorized against the empty string.
+func TestProcessPublishTopicAliasUnknownAliasEmptyTopic(t *testing.T) {
+	hook := &ruleACLHook{
+		allowedWriteTopics: map[string]bool{},
+		allowAllReads:      true,
+	}
+	s := newRuleACLServer(hook)
+
+	pub, _, _ := newTestClient()
+	pub.Properties.ProtocolVersion = 5
+	s.Clients.Add(pub)
+
+	pk := packets.Packet{
+		ProtocolVersion: 5,
+		FixedHeader:     packets.FixedHeader{Type: packets.Publish, Qos: 1},
+		PacketID:        9,
+		TopicName:       "",
+		Properties: packets.Properties{
+			TopicAlias:     42,
+			TopicAliasFlag: true,
+		},
+	}
+
+	require.ErrorIs(t, s.processPublish(pub, pk), packets.ErrTopicAliasInvalid)
+	_, ok := pub.State.TopicAliases.Inbound.Get(42)
+	require.False(t, ok)
+	require.Empty(t, hook.checks) // ACL must never run against the empty topic
+	t.Logf("unknown alias=%d with empty topic rejected before ACL", 42)
+}
+
+// TestProcessPublishTopicAliasMqtt3Unaffected ensures MQTT 3.x publishes keep
+// working unchanged: v3 has no alias properties at all.
+func TestProcessPublishTopicAliasMqtt3Unaffected(t *testing.T) {
+	s := newServer()
+	hook := &ruleACLHook{
+		allowedWriteTopics: map[string]bool{"v3/topic": true},
+		allowAllReads:      true,
+	}
+	require.NoError(t, s.AddHook(hook, nil))
+
+	sub, r, w := newTestClient()
+	sub.ID = "mqtt3-subscriber"
+	sub.Properties.ProtocolVersion = 5
+	s.Clients.Add(sub)
+	require.True(t, s.Topics.Subscribe(sub.ID, packets.Subscription{Filter: "v3/topic", Qos: 0}))
+
+	pub, _, pubW := newTestClient()
+	pub.ID = "mqtt3-publisher"
+	pub.Properties.ProtocolVersion = 4
+	s.Clients.Add(pub)
+
+	pk := packets.Packet{
+		ProtocolVersion: 4,
+		FixedHeader:     packets.FixedHeader{Type: packets.Publish, Qos: 0},
+		TopicName:       "v3/topic",
+		Payload:         []byte("mqtt3"),
+	}
+	go func() {
+		_ = s.processPublish(pub, pk)
+		time.Sleep(time.Millisecond) // let WriteLoop flush the buffered write
+		_ = w.Close()
+	}()
+
+	// No alias state must exist for an MQTT3 connection.
+	require.Empty(t, pub.State.TopicAliases.Inbound.internal)
+
+	buf, err := io.ReadAll(r)
+	require.NoError(t, err)
+	// The wire packet is v5-encoded (subscriber protocol), qos0 carries no
+	// packet id and retains the real topic name.
+	wantPk := packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Publish, Qos: 0},
+		TopicName:       "v3/topic",
+		ProtocolVersion: 5, // wire encoding is the subscriber's protocol
+		Payload:         []byte("mqtt3"),
+	}
+	var wantBuf bytes.Buffer
+	require.NoError(t, wantPk.PublishEncode(&wantBuf))
+	require.Equal(t, wantBuf.Bytes(), buf)
+	t.Logf("mqtt3 publish delivered, final topic=%q, no alias registered", "v3/topic")
+
+	_ = pubW.Close()
+}
+
+// TestProcessPublishTopicAliasReconnectReset proves inbound aliases do not
+// survive a reconnect: a stale alias from the previous connection cannot be
+// reused after ParseConnect establishes the new connection.
+func TestProcessPublishTopicAliasReconnectReset(t *testing.T) {
+	cl, _, _ := newTestClient()
+	cl.Properties.ProtocolVersion = 5
+	cl.State.TopicAliases.Inbound.Set(5, "old/connection/topic")
+
+	pk := packets.Packet{
+		ProtocolVersion: 5,
+		Connect: packets.ConnectParams{
+			ProtocolName:     []byte{'M', 'Q', 'T', 'T'},
+			Clean:            false,
+			Keepalive:        60,
+			ClientIdentifier: cl.ID,
+		},
+	}
+	cl.ParseConnect("tcp1", pk)
+
+	_, ok := cl.State.TopicAliases.Inbound.Get(5)
+	require.False(t, ok)
+	require.Empty(t, cl.State.TopicAliases.Inbound.internal)
+	t.Logf("after reconnect, stale alias=%d removed; no final topic mapping remains", 5)
+}
+
 func TestPublishToSubscribersExhaustedSendQuota(t *testing.T) {
 	s := newServer()
 	cl, r, w := newTestClient()

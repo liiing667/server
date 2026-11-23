@@ -232,6 +232,7 @@ func (cl *Client) ParseConnect(lid string, pk packets.Packet) {
 	cl.State.Inflight.ResetReceiveQuota(int32(cl.ops.options.Capabilities.ReceiveMaximum)) // server receive max per client
 	cl.State.Inflight.ResetSendQuota(int32(cl.Properties.Props.ReceiveMaximum))            // client receive max
 	cl.State.TopicAliases.Outbound = NewOutboundTopicAliases(cl.Properties.Props.TopicAliasMaximum)
+	cl.State.TopicAliases.Inbound.Reset() // [MQTT-3.1.2-27] inbound topic aliases are scoped to this connection and do not survive a (re)connect
 
 	cl.ID = pk.Connect.ClientIdentifier
 	if cl.ID == "" {

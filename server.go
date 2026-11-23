@@ -856,12 +856,32 @@ func (s *Server) InjectPacket(cl *Client, pk packets.Packet) error {
 
 // processPublish processes a Publish packet.
 func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
-	if !cl.Net.Inline && !IsValidFilter(pk.TopicName, true) {
-		return nil
-	}
-
 	if atomic.LoadInt32(&cl.State.Inflight.receiveQuota) == 0 {
 		return s.DisconnectClient(cl, packets.ErrReceiveMaximum) // ~[MQTT-3.3.4-7] ~[MQTT-3.3.4-8]
+	}
+
+	// Resolve the inbound topic alias before any authorization so that the write
+	// ACL check below, the publish hooks, retained storage and the per-subscriber
+	// read ACL all operate on the real topic under this connection's identity.
+	// A zero-length topic name is only valid when it refers to an already
+	// registered alias [MQTT-3.3.2-11]; an unknown alias is a protocol error
+	// [MQTT-3.3.2-12]. A new or redefined alias is only provisionally accepted
+	// here and must not be registered until the publish is authorized.
+	aliasAccepted := false
+	if !cl.Net.Inline && pk.Properties.TopicAliasFlag && pk.Properties.TopicAlias > 0 {
+		if pk.TopicName == "" {
+			topic, ok := cl.State.TopicAliases.Inbound.Get(pk.Properties.TopicAlias)
+			if !ok {
+				return packets.ErrTopicAliasInvalid // [MQTT-3.3.2-12]
+			}
+			pk.TopicName = topic
+		} else {
+			aliasAccepted = true
+		}
+	}
+
+	if !cl.Net.Inline && !IsValidFilter(pk.TopicName, true) {
+		return nil
 	}
 
 	if !cl.Net.Inline && !s.hooks.OnACLCheck(cl, pk.TopicName, true) {
@@ -882,6 +902,12 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 		return cl.WritePacket(ack)
 	}
 
+	// Authorization passed: it is now safe to register or refresh the inbound
+	// topic alias. On rejection above, the alias map is left untouched.
+	if aliasAccepted {
+		cl.State.TopicAliases.Inbound.Set(pk.Properties.TopicAlias, pk.TopicName)
+	}
+
 	pk.Origin = cl.ID
 	pk.Created = time.Now().Unix()
 
@@ -900,10 +926,6 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 				atomic.AddInt64(&s.Info.Inflight, -1)
 			}
 		}
-	}
-
-	if pk.Properties.TopicAliasFlag && pk.Properties.TopicAlias > 0 { // [MQTT-3.3.2-11]
-		pk.TopicName = cl.State.TopicAliases.Inbound.Set(pk.Properties.TopicAlias, pk.TopicName)
 	}
 
 	if pk.FixedHeader.Qos > s.Options.Capabilities.MaximumQos {
