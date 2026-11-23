@@ -999,25 +999,105 @@ func (s *Server) publishToSubscribers(pk packets.Packet) {
 	}
 
 	subscribers := s.Topics.Subscribers(pk.TopicName)
-	if len(subscribers.Shared) > 0 {
+	if len(subscribers.Shared) > 0 || len(subscribers.SharedSelected) > 0 || len(subscribers.SharedSelections) > 0 {
 		subscribers = s.hooks.OnSelectSubscribers(subscribers, pk)
-		if len(subscribers.SharedSelected) == 0 {
-			subscribers.SelectShared()
-		}
-		subscribers.MergeSharedSelected()
+		subscribers.PrepareSharedSelections(s.sharedSelectionEligible(pk))
 	}
 
 	for _, inlineSubscription := range subscribers.InlineSubscriptions {
 		inlineSubscription.Handler(s.inlineClient, inlineSubscription.Subscription, pk)
 	}
 
+	sharedClients := make(map[string]struct{}, len(subscribers.SharedSelections))
+	for _, selection := range subscribers.SharedSelections {
+		sharedClients[selection.Client] = struct{}{}
+	}
+
 	for id, subs := range subscribers.Subscriptions {
+		if _, ok := sharedClients[id]; ok {
+			// The client was selected for one or more shared groups. Deliver
+			// those selections instead of also delivering the normal
+			// subscription for the same publish.
+			continue
+		}
+
 		if cl, ok := s.Clients.Get(id); ok {
 			_, err := s.publishToClient(cl, subs, pk)
 			if err != nil {
 				s.Log.Debug("failed publishing packet", "error", err, "client", cl.ID, "packet", pk)
 			}
 		}
+	}
+
+	// Each shared group is a separate delivery identity. In particular, the
+	// same client may be selected by more than one group and must receive one
+	// message for each of them; merging those selections into Subscriptions
+	// would collapse the groups and would also let one candidate's no-local or
+	// qos values replace another's.
+	for _, selection := range subscribers.SharedSelections {
+		cl, ok := s.Clients.Get(selection.Client)
+		if !ok {
+			continue
+		}
+
+		sub := selection.Subscription
+		if normal, ok := subscribers.Subscriptions[selection.Client]; ok {
+			// The client also has a normal subscription matching this publish.
+			// Keep the group's selected identity (including its no-local and
+			// filter) while retaining the highest qos and all subscription
+			// identifiers, as the original merged delivery did.
+			sub = mergeSharedDelivery(sub, normal)
+		}
+
+		_, err := s.publishToClient(cl, sub, pk)
+		if err != nil {
+			s.Log.Debug("failed publishing packet", "error", err, "client", cl.ID, "packet", pk)
+		}
+	}
+}
+
+// mergeSharedDelivery combines a selected shared subscription with a normal
+// subscription for the same client without allowing the normal subscription to
+// replace the selected candidate's group, filter, no-local value or qos.
+func mergeSharedDelivery(selected, normal packets.Subscription) packets.Subscription {
+	ids := make(map[string]int, len(selected.Identifiers)+1)
+	for filter, id := range selected.Identifiers {
+		ids[filter] = id
+	}
+	for filter, id := range normal.Identifiers {
+		ids[filter] = id
+	}
+	if len(selected.Identifiers) == 0 {
+		ids[selected.Filter] = selected.Identifier
+	}
+
+	out := selected
+	out.Identifiers = ids
+
+	// A no-local normal subscription must not suppress this group's delivery;
+	// no-local was already evaluated for the selected candidate when it was
+	// chosen. Qos and identifiers are still merged to preserve the traditional
+	// single-delivery behaviour for a client with both kinds of subscription.
+	normal.NoLocal = false
+	return out.Merge(normal)
+}
+
+// sharedSelectionEligible returns a predicate which checks a shared group
+// candidate against the same no-local and ACL rules that govern delivery.
+// Applying them while selecting means an ineligible member cannot suppress the
+// whole group when another member is able to receive the message.
+func (s *Server) sharedSelectionEligible(pk packets.Packet) func(client string, sub packets.Subscription) bool {
+	return func(client string, sub packets.Subscription) bool {
+		if sub.NoLocal && pk.Origin == client {
+			return false
+		}
+
+		cl, ok := s.Clients.Get(client)
+		if !ok {
+			return false
+		}
+
+		return s.hooks.OnACLCheck(cl, pk.TopicName, false)
 	}
 }
 

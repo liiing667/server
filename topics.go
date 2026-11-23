@@ -5,6 +5,7 @@
 package mqtt
 
 import (
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -109,6 +110,7 @@ func (a *OutboundTopicAliases) Set(topic string) (uint16, bool) {
 type SharedSubscriptions struct {
 	internal map[string]map[string]packets.Subscription
 	sync.RWMutex
+	generation uint64
 }
 
 // NewSharedSubscriptions returns a new instance of Subscriptions.
@@ -125,6 +127,9 @@ func (s *SharedSubscriptions) Add(group, id string, val packets.Subscription) {
 	if _, ok := s.internal[group]; !ok {
 		s.internal[group] = map[string]packets.Subscription{}
 	}
+	if existing, ok := s.internal[group][id]; !ok || !subscriptionEqual(existing, val) {
+		s.generation++
+	}
 	s.internal[group][id] = val
 }
 
@@ -132,8 +137,17 @@ func (s *SharedSubscriptions) Add(group, id string, val packets.Subscription) {
 func (s *SharedSubscriptions) Delete(group, id string) {
 	s.Lock()
 	defer s.Unlock()
-	delete(s.internal[group], id)
-	if len(s.internal[group]) == 0 {
+	members, ok := s.internal[group]
+	if !ok {
+		return
+	}
+
+	if _, ok := members[id]; ok {
+		delete(members, id)
+		s.generation++
+	}
+
+	if len(members) == 0 {
 		delete(s.internal, group)
 	}
 }
@@ -169,8 +183,16 @@ func (s *SharedSubscriptions) Len() int {
 	return n
 }
 
-// GetAll returns all shared subscription groups and their subscriptions.
-func (s *SharedSubscriptions) GetAll() map[string]map[string]packets.Subscription {
+// Generation returns the current membership generation of the shared subscriptions.
+// It changes whenever a member is added, removed, or has its subscription changed.
+func (s *SharedSubscriptions) Generation() uint64 {
+	s.RLock()
+	defer s.RUnlock()
+	return s.generation
+}
+
+// Snapshot returns a copy of the shared subscriptions and their current generation.
+func (s *SharedSubscriptions) Snapshot() (map[string]map[string]packets.Subscription, uint64) {
 	s.RLock()
 	defer s.RUnlock()
 	m := map[string]map[string]packets.Subscription{}
@@ -183,7 +205,42 @@ func (s *SharedSubscriptions) GetAll() map[string]map[string]packets.Subscriptio
 			m[group][id] = sub
 		}
 	}
+	return m, s.generation
+}
+
+// GetAll returns all shared subscription groups and their subscriptions.
+func (s *SharedSubscriptions) GetAll() map[string]map[string]packets.Subscription {
+	m, _ := s.Snapshot()
 	return m
+}
+
+// subscriptionEqual reports whether two subscriptions describe the same membership.
+func subscriptionEqual(a, b packets.Subscription) bool {
+	if a.Filter != b.Filter ||
+		a.Identifier != b.Identifier ||
+		a.RetainHandling != b.RetainHandling ||
+		a.Qos != b.Qos ||
+		a.RetainAsPublished != b.RetainAsPublished ||
+		a.NoLocal != b.NoLocal ||
+		a.FwdRetainedFlag != b.FwdRetainedFlag ||
+		len(a.ShareName) != len(b.ShareName) ||
+		len(a.Identifiers) != len(b.Identifiers) {
+		return false
+	}
+
+	for i, v := range a.ShareName {
+		if b.ShareName[i] != v {
+			return false
+		}
+	}
+
+	for k, v := range a.Identifiers {
+		if b.Identifiers[k] != v {
+			return false
+		}
+	}
+
+	return true
 }
 
 // InlineSubFn is the signature for a callback function which will be called
@@ -308,35 +365,337 @@ type InlineSubscription struct {
 	Handler InlineSubFn
 }
 
+// SharedSelection is the immutable result of selecting one member of a shared
+// subscription group for a publish. All of the values which decide how the
+// message is delivered are bound together here: the group and member which
+// were selected, the filter which selected them, the member's own no-local and
+// qos values, and the generations which produced the selection.
+type SharedSelection struct {
+	Group                  string
+	Client                 string // the selected group member
+	Filter                 string // the member's full shared filter, including $share/<group>/
+	Subscription           packets.Subscription
+	NoLocal                bool
+	Qos                    byte
+	Generation             uint64 // selection generation; changes only when the selected member changes
+	SubscriptionGeneration uint64 // shared subscription membership generation at selection time
+}
+
+// sharedCandidate is one member of a shared subscription group which matched a publish.
+type sharedCandidate struct {
+	group      string
+	filter     string
+	client     string
+	sub        packets.Subscription
+	generation uint64
+}
+
+// sharedSelectionCache keeps the last selected member of each shared group.
+// Keeping the selection outside the per-publish Subscribers snapshot is what
+// stops a later publish from replacing the identity selected for an earlier
+// one: the same member is re-used until it is no longer present or no longer
+// eligible. The generation is only advanced when that identity actually changes.
+type sharedSelectionCache struct {
+	sync.Mutex
+	serial  uint64
+	entries map[string]SharedSelection // group + "\x00" + filter
+}
+
+func newSharedSelectionCache() *sharedSelectionCache {
+	return &sharedSelectionCache{
+		entries: map[string]SharedSelection{},
+	}
+}
+
+func sharedSelectionKey(group, filter string) string {
+	return group + "\x00" + filter
+}
+
+// sharedSelectedClient extracts a client id from a SharedSelected key. Keys
+// are normally the client id, but a group-qualified key is used when the same
+// client is selected by more than one group.
+func sharedSelectedClient(key string) string {
+	if i := strings.IndexByte(key, 0); i >= 0 {
+		return key[i+1:]
+	}
+	return key
+}
+
+// bindSharedSubscription attaches the member's subscription identifier to the
+// filter it was selected by. The identifiers map then travels with the selected
+// candidate, so another group's filter or identifier cannot replace it.
+func bindSharedSubscription(sub packets.Subscription) packets.Subscription {
+	if sub.Identifiers == nil {
+		sub.Identifiers = map[string]int{sub.Filter: sub.Identifier}
+		return sub
+	}
+
+	if sub.Identifier > 0 {
+		identifiers := make(map[string]int, len(sub.Identifiers)+1)
+		for filter, id := range sub.Identifiers {
+			identifiers[filter] = id
+		}
+		identifiers[sub.Filter] = sub.Identifier
+		sub.Identifiers = identifiers
+	}
+
+	return sub
+}
+
 // Subscribers contains the shared and non-shared subscribers matching a topic.
 type Subscribers struct {
 	Shared              map[string]map[string]packets.Subscription
 	SharedSelected      map[string]packets.Subscription
+	SharedSelections    []SharedSelection
 	Subscriptions       map[string]packets.Subscription
 	InlineSubscriptions map[int]InlineSubscription
+
+	sharedGenerations map[string]uint64 // full filter -> membership generation
+	selectionCache    *sharedSelectionCache
 }
 
 // SelectShared returns one subscriber for each shared subscription group.
 func (s *Subscribers) SelectShared() {
+	s.SelectSharedWith(nil)
+}
+
+// SelectSharedWith returns one subscriber for each shared subscription group,
+// skipping candidates which are not eligible. A group is identified by its
+// share name: several matching filters belonging to the same group still result
+// in one selected member, and the selected member's own filter, qos and
+// no-local values are preserved rather than merged with another candidate.
+func (s *Subscribers) SelectSharedWith(eligible func(client string, sub packets.Subscription) bool) {
+	s.SharedSelections = s.selectShared(eligible)
+
 	s.SharedSelected = map[string]packets.Subscription{}
-	for _, subs := range s.Shared {
-		for client, sub := range subs {
-			cls, ok := s.SharedSelected[client]
-			if !ok {
-				cls = sub
+	for _, selected := range s.SharedSelections {
+		key := selected.Client
+		if _, ok := s.SharedSelected[key]; ok {
+			// More than one group selected this member. Keep both selections
+			// instead of letting the second one replace the first.
+			key = sharedSelectionKey(selected.Group, selected.Client)
+		}
+
+		cls, ok := s.SharedSelected[key]
+		if !ok {
+			cls = selected.Subscription
+		}
+
+		s.SharedSelected[key] = cls.Merge(selected.Subscription)
+	}
+}
+
+// PrepareSharedSelections finalises shared subscription selection for a
+// publish. A hook may have supplied explicit selections in SharedSelected; in
+// that case they are adopted as-is. Otherwise one member is selected for every
+// shared group.
+func (s *Subscribers) PrepareSharedSelections(eligible func(client string, sub packets.Subscription) bool) {
+	if len(s.SharedSelections) > 0 {
+		return
+	}
+
+	if len(s.SharedSelected) > 0 {
+		s.SharedSelections = make([]SharedSelection, 0, len(s.SharedSelected))
+		for key, sub := range s.SharedSelected {
+			client := sharedSelectedClient(key)
+			group := SharedGroupName(sub.Filter)
+			if group == "" {
+				group = sub.Filter
 			}
 
-			s.SharedSelected[client] = cls.Merge(sub)
-			break
+			s.SharedSelections = append(s.SharedSelections, SharedSelection{
+				Group:                  group,
+				Client:                 client,
+				Filter:                 sub.Filter,
+				Subscription:           bindSharedSubscription(sub),
+				NoLocal:                sub.NoLocal,
+				Qos:                    sub.Qos,
+				SubscriptionGeneration: s.sharedGenerations[sub.Filter],
+			})
+		}
+
+		sort.Slice(s.SharedSelections, func(i, j int) bool {
+			if s.SharedSelections[i].Group != s.SharedSelections[j].Group {
+				return s.SharedSelections[i].Group < s.SharedSelections[j].Group
+			}
+			if s.SharedSelections[i].Filter != s.SharedSelections[j].Filter {
+				return s.SharedSelections[i].Filter < s.SharedSelections[j].Filter
+			}
+			return s.SharedSelections[i].Client < s.SharedSelections[j].Client
+		})
+		return
+	}
+
+	s.SelectSharedWith(eligible)
+}
+
+// selectShared chooses one member per share group. Candidates are ordered by
+// filter and client so selection is deterministic; a previous selection is
+// retained while that member is still present and eligible.
+func (s *Subscribers) selectShared(eligible func(client string, sub packets.Subscription) bool) []SharedSelection {
+	if len(s.Shared) == 0 {
+		return nil
+	}
+
+	groups := map[string][]sharedCandidate{}
+	for filter, members := range s.Shared {
+		group := SharedGroupName(filter)
+		if group == "" {
+			group = filter
+		}
+
+		for client, sub := range members {
+			groups[group] = append(groups[group], sharedCandidate{
+				group:      group,
+				filter:     filter,
+				client:     client,
+				sub:        sub,
+				generation: s.sharedGenerations[filter],
+			})
 		}
 	}
+
+	names := make([]string, 0, len(groups))
+	for group := range groups {
+		names = append(names, group)
+	}
+	sort.Strings(names)
+
+	selected := make([]SharedSelection, 0, len(names))
+	for _, group := range names {
+		candidates := groups[group]
+		sort.Slice(candidates, func(i, j int) bool {
+			if candidates[i].filter != candidates[j].filter {
+				return candidates[i].filter < candidates[j].filter
+			}
+			return candidates[i].client < candidates[j].client
+		})
+
+		var generation uint64
+		for _, candidate := range candidates {
+			if candidate.generation > generation {
+				generation = candidate.generation
+			}
+		}
+
+		candidate, ok := s.cachedSharedSelection(group, candidates, eligible)
+		if !ok {
+			for _, c := range candidates {
+				if eligible != nil && !eligible(c.client, c.sub) {
+					continue
+				}
+				candidate = c
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			continue
+		}
+
+		sel := SharedSelection{
+			Group:                  candidate.group,
+			Client:                 candidate.client,
+			Filter:                 candidate.filter,
+			Subscription:           bindSharedSubscription(candidate.sub),
+			NoLocal:                candidate.sub.NoLocal,
+			Qos:                    candidate.sub.Qos,
+			SubscriptionGeneration: generation,
+		}
+		sel.Generation = s.rememberSharedSelection(sel)
+		selected = append(selected, sel)
+	}
+
+	return selected
+}
+
+// cachedSharedSelection returns the most recent selection for a group which is
+// still a live, eligible candidate.
+func (s *Subscribers) cachedSharedSelection(group string, candidates []sharedCandidate, eligible func(client string, sub packets.Subscription) bool) (sharedCandidate, bool) {
+	if s.selectionCache == nil {
+		return sharedCandidate{}, false
+	}
+
+	s.selectionCache.Lock()
+	entries := make([]SharedSelection, 0, len(s.selectionCache.entries))
+	for _, entry := range s.selectionCache.entries {
+		if entry.Group == group {
+			entries = append(entries, entry)
+		}
+	}
+	s.selectionCache.Unlock()
+
+	var best SharedSelection
+	var found bool
+	for _, candidate := range candidates {
+		for _, entry := range entries {
+			if entry.Client != candidate.client || entry.Filter != candidate.filter {
+				continue
+			}
+			if found && entry.Generation <= best.Generation {
+				continue
+			}
+			if eligible != nil && !eligible(candidate.client, candidate.sub) {
+				continue
+			}
+			best = entry
+			found = true
+		}
+	}
+
+	if !found {
+		return sharedCandidate{}, false
+	}
+
+	for _, candidate := range candidates {
+		if candidate.client == best.Client && candidate.filter == best.Filter {
+			return candidate, true
+		}
+	}
+
+	return sharedCandidate{}, false
+}
+
+// rememberSharedSelection records a selected identity in the cache and returns
+// its selection generation. Re-selecting the same member keeps the generation;
+// a different member gets a new one.
+func (s *Subscribers) rememberSharedSelection(sel SharedSelection) uint64 {
+	if s.selectionCache == nil {
+		return 0
+	}
+
+	s.selectionCache.Lock()
+	defer s.selectionCache.Unlock()
+
+	key := sharedSelectionKey(sel.Group, sel.Filter)
+	var latest uint64
+	for _, entry := range s.selectionCache.entries {
+		if entry.Group == sel.Group && entry.Generation > latest {
+			latest = entry.Generation
+		}
+	}
+
+	if existing, ok := s.selectionCache.entries[key]; ok &&
+		existing.Client == sel.Client &&
+		existing.Filter == sel.Filter &&
+		existing.Generation == latest &&
+		subscriptionEqual(existing.Subscription, sel.Subscription) {
+		sel.Generation = existing.Generation
+	} else {
+		s.selectionCache.serial++
+		sel.Generation = s.selectionCache.serial
+	}
+
+	s.selectionCache.entries[key] = sel
+	return sel.Generation
 }
 
 // MergeSharedSelected merges the selected subscribers for a shared subscription group
 // and the non-shared subscribers, to ensure that no subscriber gets multiple messages
 // due to have both types of subscription matching the same filter.
 func (s *Subscribers) MergeSharedSelected() {
-	for client, sub := range s.SharedSelected {
+	for key, sub := range s.SharedSelected {
+		client := sharedSelectedClient(key)
 		cls, ok := s.Subscriptions[client]
 		if !ok {
 			cls = sub
@@ -348,8 +707,9 @@ func (s *Subscribers) MergeSharedSelected() {
 
 // TopicsIndex is a prefix/trie tree containing topic subscribers and retained messages.
 type TopicsIndex struct {
-	Retained *packets.Packets
-	root     *particle // a leaf containing a message and more leaves.
+	Retained        *packets.Packets
+	root            *particle // a leaf containing a message and more leaves.
+	sharedSelection *sharedSelectionCache
 }
 
 // NewTopicsIndex returns a pointer to a new instance of Index.
@@ -360,6 +720,7 @@ func NewTopicsIndex() *TopicsIndex {
 			particles:     newParticles(),
 			subscriptions: NewSubscriptions(),
 		},
+		sharedSelection: newSharedSelectionCache(),
 	}
 }
 
@@ -584,8 +945,11 @@ func (x *TopicsIndex) Subscribers(topic string) *Subscribers {
 	return x.scanSubscribers(topic, 0, nil, &Subscribers{
 		Shared:              map[string]map[string]packets.Subscription{},
 		SharedSelected:      map[string]packets.Subscription{},
+		SharedSelections:    []SharedSelection{},
 		Subscriptions:       map[string]packets.Subscription{},
 		InlineSubscriptions: map[int]InlineSubscription{},
+		sharedGenerations:   map[string]uint64{},
+		selectionCache:      x.sharedSelection,
 	})
 }
 
@@ -652,14 +1016,21 @@ func (x *TopicsIndex) gatherSharedSubscriptions(particle *particle, subs *Subscr
 	if subs.Shared == nil {
 		subs.Shared = map[string]map[string]packets.Subscription{}
 	}
+	if subs.sharedGenerations == nil {
+		subs.sharedGenerations = map[string]uint64{}
+	}
 
-	for _, shares := range particle.shared.GetAll() {
-		for client, sub := range shares {
+	shares, generation := particle.shared.Snapshot()
+	for _, members := range shares {
+		for client, sub := range members {
 			if _, ok := subs.Shared[sub.Filter]; !ok {
 				subs.Shared[sub.Filter] = map[string]packets.Subscription{}
 			}
 
 			subs.Shared[sub.Filter][client] = sub
+			if generation > subs.sharedGenerations[sub.Filter] {
+				subs.sharedGenerations[sub.Filter] = generation
+			}
 		}
 	}
 }
@@ -701,6 +1072,21 @@ func isolateParticle(filter string, d int) (particle string, hasNext bool) {
 func IsSharedFilter(filter string) bool {
 	prefix, _ := isolateParticle(filter, 0)
 	return strings.EqualFold(prefix, SharePrefix)
+}
+
+// SharedGroupName returns the share group of a shared filter, or an empty
+// string if the filter does not use the shared subscription syntax.
+func SharedGroupName(filter string) string {
+	prefix, hasNext := isolateParticle(filter, 0)
+	if !hasNext || !strings.EqualFold(prefix, SharePrefix) {
+		return ""
+	}
+
+	group, hasNext := isolateParticle(filter, 1)
+	if !hasNext {
+		return ""
+	}
+	return group
 }
 
 // IsValidFilter returns true if the filter is valid.
