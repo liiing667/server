@@ -103,12 +103,13 @@ func (cl *Clients) GetByListener(id string) []*Client {
 
 // Client contains information about a client known by the broker.
 type Client struct {
-	Properties   ClientProperties // client properties
-	State        ClientState      // the operational state of the client.
-	Net          ClientConnection // network connection state of the client
-	ID           string           // the client id.
-	ops          *ops             // ops provides a reference to server ops.
-	sync.RWMutex                  // mutex
+	Properties ClientProperties    // client properties
+	State      ClientState         // the operational state of the client.
+	Net        ClientConnection    // network connection state of the client
+	SizeBudget *packets.SizeBudget // shared byte budget for fixed header admission, remaining length, read/write buffers and the packet consumer
+	ID         string              // the client id.
+	ops        *ops                // ops provides a reference to server ops.
+	sync.RWMutex                   // mutex
 }
 
 // ClientConnection contains the connection transport and metadata for the client.
@@ -155,6 +156,8 @@ type ClientState struct {
 	open            context.Context      // indicate that the client is open for packet exchange
 	cancelOpen      context.CancelFunc   // cancel function for open context
 	outboundQty     int32                // number of messages currently in the outbound queue
+	outbufReserved  int64                // size-budget bytes currently held by the coalescing outbound write buffer
+	writeFailures   int64                // number of outbound packets that failed to be written to the connection
 	Keepalive       uint16               // the number of seconds the connection can wait
 	ServerKeepalive bool                 // keepalive was set by the server
 }
@@ -176,18 +179,72 @@ func newClient(c net.Conn, o *ops) *Client {
 		Properties: ClientProperties{
 			ProtocolVersion: defaultClientProtocolVersion, // default protocol version
 		},
+		SizeBudget: packets.NewSizeBudget(budgetLimit(o)),
 		ops: o,
 	}
 
 	if c != nil {
+		readBufferSize := o.options.ClientNetReadBufferSize
+		if max := int(cl.SizeBudget.Limit()); readBufferSize > max {
+			readBufferSize = max // the read buffer itself is bounded by the shared size budget
+		}
+		if readBufferSize < 1 {
+			readBufferSize = 1
+		}
 		cl.Net = ClientConnection{
 			Conn:   c,
-			bconn:  bufio.NewReaderSize(c, o.options.ClientNetReadBufferSize),
+			bconn:  bufio.NewReaderSize(c, readBufferSize),
 			Remote: c.RemoteAddr().String(),
 		}
 	}
 
 	return cl
+}
+
+// budgetLimit resolves the shared whole-packet size budget for a new connection.
+// A configured server capability takes precedence; otherwise the MQTT maximum
+// encodable packet size is used so client input can never drive an unbounded
+// allocation.
+func budgetLimit(o *ops) uint32 {
+	if o != nil && o.options != nil && o.options.Capabilities != nil &&
+		o.options.Capabilities.MaximumPacketSize > 0 {
+		return o.options.Capabilities.MaximumPacketSize
+	}
+	return packets.DefaultSizeBudget
+}
+
+// SetPacketSizeLimit narrows (or restores) the shared size budget from the
+// negotiated Maximum Packet Size. The effective limit is the smaller of the
+// server capability and the client advertised limit, so fixed header admission,
+// remaining length, read/write buffers and the packet consumer all share one
+// budget. A zero value restores the server configured default.
+func (cl *Client) SetPacketSizeLimit(clientLimit uint32) {
+	limit := budgetLimit(cl.ops)
+	if clientLimit > 0 && clientLimit < limit {
+		limit = clientLimit
+	}
+	cl.SizeBudget.SetLimit(limit)
+}
+
+// WriteFailures returns the number of queued outbound packets which could not be
+// written to the underlying connection.
+func (cl *Client) WriteFailures() int64 {
+	return atomic.LoadInt64(&cl.State.writeFailures)
+}
+
+// flushBudgetDeltas rolls the per-connection size-budget counters (allocated
+// bytes, consumed bytes and rejections) into the process-wide system info once.
+func (cl *Client) flushBudgetDeltas() {
+	allocated, consumed, rejected := cl.SizeBudget.FlushDeltas()
+	if allocated != 0 {
+		atomic.AddInt64(&cl.ops.info.PacketBytesAllocated, allocated)
+	}
+	if consumed != 0 {
+		atomic.AddInt64(&cl.ops.info.PacketBytesConsumed, consumed)
+	}
+	if rejected != 0 {
+		atomic.AddInt64(&cl.ops.info.PacketBytesRejected, rejected)
+	}
 }
 
 // WriteLoop ranges over pending outbound messages and writes them to the client connection.
@@ -196,8 +253,31 @@ func (cl *Client) WriteLoop() {
 		select {
 		case pk := <-cl.State.outbound:
 			if err := cl.WritePacket(*pk); err != nil {
-				// TODO : Figure out what to do with error
-				cl.ops.log.Debug("failed publishing packet", "error", err, "client", cl.ID, "packet", pk)
+				// The message failed after it left the broker's control surface:
+				// record precisely which packet failed (packet id, type and topic)
+				// instead of silently swallowing the error. For qos > 0 messages the
+				// in-flight entry must be rolled back so the quota is not leaked.
+				atomic.AddInt64(&cl.State.writeFailures, 1)
+				if pk.FixedHeader.Type == packets.Publish {
+					cl.ops.hooks.OnPublishDropped(cl, *pk)
+				}
+				cl.ops.log.Error("failed writing outbound packet",
+					"error", err,
+					"client", cl.ID,
+					"packet_id", pk.PacketID,
+					"packet_type", packets.PacketNames[pk.FixedHeader.Type],
+					"topic", pk.TopicName,
+					"qos", pk.FixedHeader.Qos,
+				)
+
+				if pk.FixedHeader.Type == packets.Publish && pk.FixedHeader.Qos > 0 && pk.PacketID > 0 {
+					if ok := cl.State.Inflight.Delete(pk.PacketID); ok {
+						cl.ops.hooks.OnQosDropped(cl, *pk)
+						atomic.AddInt64(&cl.ops.info.Inflight, -1)
+						atomic.AddInt64(&cl.ops.info.MessagesDropped, 1)
+					}
+					cl.State.Inflight.IncreaseSendQuota()
+				}
 			}
 			atomic.AddInt32(&cl.State.outboundQty, -1)
 		case <-cl.State.open.Done():
@@ -232,6 +312,11 @@ func (cl *Client) ParseConnect(lid string, pk packets.Packet) {
 	cl.State.Inflight.ResetReceiveQuota(int32(cl.ops.options.Capabilities.ReceiveMaximum)) // server receive max per client
 	cl.State.Inflight.ResetSendQuota(int32(cl.Properties.Props.ReceiveMaximum))            // client receive max
 	cl.State.TopicAliases.Outbound = NewOutboundTopicAliases(cl.Properties.Props.TopicAliasMaximum)
+
+	// Narrow the shared size budget to the smaller of the server capability and
+	// the client advertised Maximum Packet Size, so every lifecycle stage stays
+	// on one budget for the lifetime of the connection.
+	cl.SetPacketSizeLimit(pk.Properties.MaximumPacketSize)
 
 	cl.ID = pk.Connect.ClientIdentifier
 	if cl.ID == "" {
@@ -453,8 +538,12 @@ func (cl *Client) ReadFixedHeader(fh *packets.FixedHeader) error {
 		return err
 	}
 
-	if cl.ops.options.Capabilities.MaximumPacketSize > 0 && uint32(fh.Remaining+1) > cl.ops.options.Capabilities.MaximumPacketSize {
-		return packets.ErrPacketTooLarge // [MQTT-3.2.2-15]
+	// Admit the packet against the shared whole-packet size budget before any
+	// payload buffer is allocated. This is the unbounded-allocation guard: the
+	// remaining length above is untrusted client input.
+	if _, err = cl.SizeBudget.AdmitFixedHeader(fh.Remaining, bu); err != nil {
+		cl.flushBudgetDeltas()
+		return err // [MQTT-3.2.2-15]
 	}
 
 	atomic.AddInt64(&cl.ops.info.BytesReceived, int64(bu+1))
@@ -467,7 +556,18 @@ func (cl *Client) ReadPacket(fh *packets.FixedHeader) (pk packets.Packet, err er
 
 	pk.ProtocolVersion = cl.Properties.ProtocolVersion // inherit client protocol version for decoding
 	pk.FixedHeader = *fh
-	p := make([]byte, pk.FixedHeader.Remaining)
+
+	// Reserve the remaining bytes against the shared budget before allocating.
+	// ReadFixedHeader has already admitted the whole packet, so this only fails
+	// if concurrent buffer usage exhausted the per-connection allowance.
+	remaining := pk.FixedHeader.Remaining
+	if err = cl.SizeBudget.Reserve(remaining); err != nil {
+		cl.flushBudgetDeltas()
+		return pk, err
+	}
+	defer cl.SizeBudget.Release(remaining)
+
+	p := make([]byte, remaining)
 	n, err := io.ReadFull(cl.Net.bconn, p)
 	if err != nil {
 		return pk, err
@@ -475,9 +575,10 @@ func (cl *Client) ReadPacket(fh *packets.FixedHeader) (pk packets.Packet, err er
 
 	atomic.AddInt64(&cl.ops.info.BytesReceived, int64(n))
 
-	// Decode the remaining packet values using a fresh copy of the bytes,
-	// otherwise the next packet will change the data of this one.
-	px := append([]byte{}, p[:]...)
+	// Decode directly from the reserved buffer. Decoders only slice the bytes for
+	// payloads/strings, so the packet keeps a reference to this single allocation
+	// rather than copying it into a second, equally large buffer.
+	px := p[:n]
 	switch pk.FixedHeader.Type {
 	case packets.Connect:
 		err = pk.ConnectDecode(px)
@@ -517,6 +618,10 @@ func (cl *Client) ReadPacket(fh *packets.FixedHeader) (pk packets.Packet, err er
 	if err != nil {
 		return pk, err
 	}
+
+	// The bytes have reached the final packet consumer: account for them once.
+	cl.SizeBudget.AddConsumed(n)
+	cl.flushBudgetDeltas()
 
 	pk, err = cl.ops.hooks.OnPacketRead(cl, pk)
 	return
@@ -595,8 +700,13 @@ func (cl *Client) WritePacket(pk packets.Packet) error {
 		return err
 	}
 
-	if pk.Mods.MaxSize > 0 && uint32(buf.Len()) > pk.Mods.MaxSize {
-		return packets.ErrPacketTooLarge // [MQTT-3.1.2-24] [MQTT-3.1.2-25]
+	// The encoded packet is admitted against the same shared size budget used on
+	// the read path, additionally narrowed by any client advertised Maximum
+	// Packet Size. This keeps fixed header admission, remaining length, read
+	// buffer, write buffer and packet consumer on one budget.
+	if err = cl.SizeBudget.AdmitSize(buf.Len(), pk.Mods.MaxSize); err != nil {
+		cl.flushBudgetDeltas()
+		return err // [MQTT-3.1.2-24] [MQTT-3.1.2-25]
 	}
 
 	n, err := func() (int64, error) {
@@ -604,32 +714,63 @@ func (cl *Client) WritePacket(pk packets.Packet) error {
 		defer cl.Unlock()
 		if len(cl.State.outbound) == 0 {
 			if cl.Net.outbuf == nil {
-				return buf.WriteTo(cl.Net.Conn)
+				// Direct write: reserve only for the duration of the syscall, so
+				// the live budget reflects bytes actually in flight.
+				if err := cl.SizeBudget.Reserve(buf.Len()); err != nil {
+					return 0, err
+				}
+				written, werr := buf.WriteTo(cl.Net.Conn)
+				cl.SizeBudget.Release(buf.Len())
+				if werr == nil {
+					cl.SizeBudget.AddConsumed(int(written))
+				}
+				return written, werr
 			}
 
 			// first write to buffer, then flush buffer
+			if err := cl.chargeWriteBuffer(buf.Len()); err != nil {
+				return 0, err
+			}
 			n, _ := cl.Net.outbuf.Write(buf.Bytes()) // will always be successful
-			err = cl.flushOutbuf()
+			flushed, err := cl.flushOutbuf()
+			if err == nil {
+				cl.SizeBudget.AddConsumed(flushed)
+			}
 			return int64(n), err
 		}
 
 		// there are more writes in the queue
 		if cl.Net.outbuf == nil {
 			if buf.Len() >= cl.ops.options.ClientNetWriteBufferSize {
-				return buf.WriteTo(cl.Net.Conn)
+				if err := cl.SizeBudget.Reserve(buf.Len()); err != nil {
+					return 0, err
+				}
+				written, werr := buf.WriteTo(cl.Net.Conn)
+				cl.SizeBudget.Release(buf.Len())
+				if werr == nil {
+					cl.SizeBudget.AddConsumed(int(written))
+				}
+				return written, werr
 			}
-			cl.Net.outbuf = new(bytes.Buffer)
+			cl.Net.outbuf = cl.newWriteBuffer()
 		}
 
+		if err := cl.chargeWriteBuffer(buf.Len()); err != nil {
+			return 0, err
+		}
 		n, _ := cl.Net.outbuf.Write(buf.Bytes()) // will always be successful
 		if cl.Net.outbuf.Len() < cl.ops.options.ClientNetWriteBufferSize {
 			return int64(n), nil
 		}
 
-		err = cl.flushOutbuf()
+		flushed, err := cl.flushOutbuf()
+		if err == nil {
+			cl.SizeBudget.AddConsumed(flushed)
+		}
 		return int64(n), err
 	}()
 	if err != nil {
+		cl.flushBudgetDeltas()
 		return err
 	}
 
@@ -638,20 +779,56 @@ func (cl *Client) WritePacket(pk packets.Packet) error {
 	if pk.FixedHeader.Type == packets.Publish {
 		atomic.AddInt64(&cl.ops.info.MessagesSent, 1)
 	}
+	cl.flushBudgetDeltas()
 
 	cl.ops.hooks.OnPacketSent(cl, pk, buf.Bytes())
 
 	return err
 }
 
-func (cl *Client) flushOutbuf() (err error) {
+// newWriteBuffer allocates the coalescing outbound write buffer. Its initial
+// capacity is clamped to the shared size budget so a tiny configured packet
+// limit cannot be undermined by an oversized pre-allocation.
+func (cl *Client) newWriteBuffer() *bytes.Buffer {
+	size := cl.ops.options.ClientNetWriteBufferSize
+	if max := int(cl.SizeBudget.Limit()); size > max {
+		size = max
+	}
+	if size < 1 {
+		size = 1
+	}
+	return bytes.NewBuffer(make([]byte, 0, size))
+}
+
+// chargeWriteBuffer reserves n bytes for data about to be appended to the
+// coalescing outbound buffer. The reservation stays live until the buffer is
+// flushed to the connection, so concurrent buffered packets cannot exceed the
+// shared size budget.
+func (cl *Client) chargeWriteBuffer(n int) error {
+	if err := cl.SizeBudget.Reserve(n); err != nil {
+		return err
+	}
+	atomic.AddInt64(&cl.State.outbufReserved, int64(n))
+	return nil
+}
+
+// flushOutbuf writes the coalescing outbound buffer to the connection and
+// returns the number of bytes flushed. On success the buffer is released.
+func (cl *Client) flushOutbuf() (flushed int, err error) {
 	if cl.Net.outbuf == nil {
-		return
+		return 0, nil
 	}
 
+	flushed = cl.Net.outbuf.Len()
 	_, err = cl.Net.outbuf.WriteTo(cl.Net.Conn)
 	if err == nil {
 		cl.Net.outbuf = nil
 	}
-	return
+	// bytes.Buffer.WriteTo drains the whole buffer on success (and on a partial
+	// write error the connection is unusable anyway), so release the full
+	// reservation associated with the coalescing buffer.
+	if reserved := atomic.SwapInt64(&cl.State.outbufReserved, 0); reserved > 0 {
+		cl.SizeBudget.Release(int(reserved))
+	}
+	return flushed, err
 }

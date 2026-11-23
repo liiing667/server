@@ -1104,9 +1104,25 @@ func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packet
 		atomic.AddInt64(&s.Info.MessagesDropped, 1)
 		cl.ops.hooks.OnPublishDropped(cl, pk)
 		if out.FixedHeader.Qos > 0 {
-			cl.State.Inflight.Delete(out.PacketID) // packet was dropped due to irregular circumstances, so rollback inflight.
+			if ok := cl.State.Inflight.Delete(out.PacketID); ok { // packet was dropped due to irregular circumstances, so rollback inflight.
+				cl.ops.hooks.OnQosDropped(cl, out)
+				atomic.AddInt64(&s.Info.Inflight, -1)
+			}
 			cl.State.Inflight.IncreaseSendQuota()
 		}
+		// Surface exactly which message failed (client, packet id, type, topic)
+		// instead of dropping it with an opaque error, so slow-subscriber drops
+		// are attributable end to end.
+		s.Log.Error("outbound queue exhausted, dropping packet",
+			"error", packets.ErrPendingClientWritesExceeded,
+			"client", cl.ID,
+			"packet_id", out.PacketID,
+			"packet_type", packets.PacketNames[out.FixedHeader.Type],
+			"topic", out.TopicName,
+			"qos", out.FixedHeader.Qos,
+			"queue_capacity", cl.ops.options.Capabilities.MaximumClientWritesPending,
+			"queue_pending", atomic.LoadInt32(&cl.State.outboundQty),
+		)
 		return out, packets.ErrPendingClientWritesExceeded
 	}
 
@@ -1460,26 +1476,29 @@ func (s *Server) publishSysTopics() {
 
 	info := s.Info.Clone()
 	topics := map[string]string{
-		SysPrefix + "/broker/version":              s.Info.Version,
-		SysPrefix + "/broker/time":                 Int64toa(info.Time),
-		SysPrefix + "/broker/uptime":               Int64toa(info.Uptime),
-		SysPrefix + "/broker/started":              Int64toa(info.Started),
-		SysPrefix + "/broker/load/bytes/received":  Int64toa(info.BytesReceived),
-		SysPrefix + "/broker/load/bytes/sent":      Int64toa(info.BytesSent),
-		SysPrefix + "/broker/clients/connected":    Int64toa(info.ClientsConnected),
-		SysPrefix + "/broker/clients/disconnected": Int64toa(info.ClientsDisconnected),
-		SysPrefix + "/broker/clients/maximum":      Int64toa(info.ClientsMaximum),
-		SysPrefix + "/broker/clients/total":        Int64toa(info.ClientsTotal),
-		SysPrefix + "/broker/packets/received":     Int64toa(info.PacketsReceived),
-		SysPrefix + "/broker/packets/sent":         Int64toa(info.PacketsSent),
-		SysPrefix + "/broker/messages/received":    Int64toa(info.MessagesReceived),
-		SysPrefix + "/broker/messages/sent":        Int64toa(info.MessagesSent),
-		SysPrefix + "/broker/messages/dropped":     Int64toa(info.MessagesDropped),
-		SysPrefix + "/broker/messages/inflight":    Int64toa(info.Inflight),
-		SysPrefix + "/broker/retained":             Int64toa(info.Retained),
-		SysPrefix + "/broker/subscriptions":        Int64toa(info.Subscriptions),
-		SysPrefix + "/broker/system/memory":        Int64toa(info.MemoryAlloc),
-		SysPrefix + "/broker/system/threads":       Int64toa(info.Threads),
+		SysPrefix + "/broker/version":                 s.Info.Version,
+		SysPrefix + "/broker/time":                    Int64toa(info.Time),
+		SysPrefix + "/broker/uptime":                  Int64toa(info.Uptime),
+		SysPrefix + "/broker/started":                 Int64toa(info.Started),
+		SysPrefix + "/broker/load/bytes/received":     Int64toa(info.BytesReceived),
+		SysPrefix + "/broker/load/bytes/sent":         Int64toa(info.BytesSent),
+		SysPrefix + "/broker/clients/connected":       Int64toa(info.ClientsConnected),
+		SysPrefix + "/broker/clients/disconnected":    Int64toa(info.ClientsDisconnected),
+		SysPrefix + "/broker/clients/maximum":         Int64toa(info.ClientsMaximum),
+		SysPrefix + "/broker/clients/total":           Int64toa(info.ClientsTotal),
+		SysPrefix + "/broker/packets/received":        Int64toa(info.PacketsReceived),
+		SysPrefix + "/broker/packets/sent":            Int64toa(info.PacketsSent),
+		SysPrefix + "/broker/packets/bytes/allocated": Int64toa(info.PacketBytesAllocated),
+		SysPrefix + "/broker/packets/bytes/consumed":  Int64toa(info.PacketBytesConsumed),
+		SysPrefix + "/broker/packets/bytes/rejected":  Int64toa(info.PacketBytesRejected),
+		SysPrefix + "/broker/messages/received":       Int64toa(info.MessagesReceived),
+		SysPrefix + "/broker/messages/sent":           Int64toa(info.MessagesSent),
+		SysPrefix + "/broker/messages/dropped":        Int64toa(info.MessagesDropped),
+		SysPrefix + "/broker/messages/inflight":       Int64toa(info.Inflight),
+		SysPrefix + "/broker/retained":                Int64toa(info.Retained),
+		SysPrefix + "/broker/subscriptions":           Int64toa(info.Subscriptions),
+		SysPrefix + "/broker/system/memory":           Int64toa(info.MemoryAlloc),
+		SysPrefix + "/broker/system/threads":          Int64toa(info.Threads),
 	}
 
 	for topic, payload := range topics {
@@ -1614,6 +1633,9 @@ func (s *Server) loadServerInfo(v system.Info) {
 		atomic.StoreInt64(&s.Info.MessagesDropped, v.MessagesDropped)
 		atomic.StoreInt64(&s.Info.PacketsReceived, v.PacketsReceived)
 		atomic.StoreInt64(&s.Info.PacketsSent, v.PacketsSent)
+		atomic.StoreInt64(&s.Info.PacketBytesAllocated, v.PacketBytesAllocated)
+		atomic.StoreInt64(&s.Info.PacketBytesConsumed, v.PacketBytesConsumed)
+		atomic.StoreInt64(&s.Info.PacketBytesRejected, v.PacketBytesRejected)
 		atomic.StoreInt64(&s.Info.InflightDropped, v.InflightDropped)
 	}
 	atomic.StoreInt64(&s.Info.Retained, v.Retained)

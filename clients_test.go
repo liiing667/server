@@ -471,6 +471,7 @@ func TestClientReadFixedHeaderDecodeError(t *testing.T) {
 func TestClientReadFixedHeaderPacketOversized(t *testing.T) {
 	cl, r, _ := newTestClient()
 	cl.ops.options.Capabilities.MaximumPacketSize = 2
+	cl.SetPacketSizeLimit(0) // propagate the capability into the shared size budget
 	defer cl.Stop(errClientStop)
 
 	go func() {
@@ -482,6 +483,8 @@ func TestClientReadFixedHeaderPacketOversized(t *testing.T) {
 	err := cl.ReadFixedHeader(fh)
 	require.Error(t, err)
 	require.ErrorIs(t, err, packets.ErrPacketTooLarge)
+	require.Equal(t, int64(1), cl.SizeBudget.Rejected())
+	require.Equal(t, int64(1), atomic.LoadInt64(&cl.ops.info.PacketBytesRejected))
 }
 
 func TestClientReadFixedHeaderReadEOF(t *testing.T) {
