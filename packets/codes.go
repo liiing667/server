@@ -145,5 +145,6 @@ var (
 		ErrMalformedUsername:          ErrMalformedUsernameOrPassword,
 		ErrMalformedPassword:          ErrMalformedUsernameOrPassword,
 		ErrBadUsernameOrPassword:      Err3NotAuthorized,
+		ErrNotAuthorized:              Err3NotAuthorized,
 	}
 )

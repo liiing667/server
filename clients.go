@@ -151,6 +151,9 @@ type ClientState struct {
 	outbound        chan *packets.Packet // queue for pending outbound packets
 	endOnce         sync.Once            // only end once
 	isTakenOver     atomic.Bool          // used to identify orphaned clients
+	willCanceled    atomic.Bool          // the will must not be published for this session
+	willPending     atomic.Bool          // sendLWT has already handled the will for this session
+	willOrigin      string               // publishing identity frozen when the will was admitted
 	packetID        uint32               // the current highest packetID
 	open            context.Context      // indicate that the client is open for packet exchange
 	cancelOpen      context.CancelFunc   // cancel function for open context
@@ -239,8 +242,12 @@ func (cl *Client) ParseConnect(lid string, pk packets.Packet) {
 		cl.Properties.Props.AssignedClientID = cl.ID
 	}
 
+	cl.Properties.Will = Will{}
+	cl.State.willCanceled.Store(false)
+	cl.State.willPending.Store(false)
+	cl.State.willOrigin = ""
 	if pk.Connect.WillFlag {
-		cl.Properties.Will = Will{
+		will := Will{
 			Qos:               pk.Connect.WillQos,
 			Retain:            pk.Connect.WillRetain,
 			Payload:           pk.Connect.WillPayload,
@@ -248,14 +255,56 @@ func (cl *Client) ParseConnect(lid string, pk packets.Packet) {
 			WillDelayInterval: pk.Connect.WillProperties.WillDelayInterval,
 			User:              pk.Connect.WillProperties.User,
 		}
-		if pk.Properties.SessionExpiryIntervalFlag &&
-			pk.Properties.SessionExpiryInterval < pk.Connect.WillProperties.WillDelayInterval {
-			cl.Properties.Will.WillDelayInterval = pk.Properties.SessionExpiryInterval
+
+		// The Will Delay Interval is bounded by the Session Expiry Interval
+		// [MQTT-3.1.2.11]. For v5 an unset Session Expiry Interval means the
+		// session ends when the connection closes, so the will is due
+		// immediately.
+		if cl.Properties.ProtocolVersion >= 5 {
+			sessionExpiry := pk.Properties.SessionExpiryInterval
+			if cl.ops != nil && cl.ops.options != nil && cl.ops.options.Capabilities != nil {
+				if maxExpiry := cl.ops.options.Capabilities.MaximumSessionExpiryInterval; maxExpiry > 0 && sessionExpiry > maxExpiry {
+					sessionExpiry = maxExpiry
+				}
+			}
+			if will.WillDelayInterval > sessionExpiry {
+				will.WillDelayInterval = sessionExpiry
+			}
+		} else if pk.Properties.SessionExpiryIntervalFlag &&
+			pk.Properties.SessionExpiryInterval < will.WillDelayInterval {
+			will.WillDelayInterval = pk.Properties.SessionExpiryInterval
 		}
-		if pk.Connect.WillFlag {
-			cl.Properties.Will.Flag = 1 // atomic for checking
+
+		will.Flag = 1 // atomic for checking
+
+		// Will admission happens once, here, and freezes the topic, payload,
+		// delay and publishing identity for this session. A will which cannot
+		// legally be published to its topic, or which this connection cannot
+		// write to, is not admitted. The decision is repeated when the will is
+		// actually published, because the ACL may change during the delay
+		// window. An invalid topic is left in place so validateConnect can
+		// reject the CONNECT with a protocol error.
+		cl.Properties.Will = will
+		if IsValidFilter(will.TopicName, true) && !clientWillAuthorized(cl, will.TopicName) {
+			cl.Properties.Will = Will{}
+		} else {
+			cl.State.willOrigin = cl.ID
 		}
 	}
+}
+
+// clientWillAuthorized reports whether the client may publish to the will
+// topic. A server with no ACL hook has nothing to enforce, so the will is
+// admitted; adding an ACL hook makes its answer authoritative.
+func clientWillAuthorized(cl *Client, topic string) bool {
+	if cl.Net.Inline {
+		return true
+	}
+	if cl.ops == nil || cl.ops.hooks == nil || !cl.ops.hooks.Provides(OnACLCheck) {
+		return true
+	}
+
+	return cl.ops.hooks.OnACLCheck(cl, topic, true)
 }
 
 // refreshDeadline refreshes the read/write deadline for the net.Conn connection.
@@ -405,8 +454,32 @@ func (cl *Client) Stop(err error) {
 			cl.State.cancelOpen()
 		}
 
+		// A graceful disconnect, a takeover or a server shutdown must not
+		// publish the old session's will. Any other close (network error,
+		// protocol violation, DISCONNECT with 0x04) leaves the will armed.
+		if stopSuppressesWill(err) {
+			atomic.StoreUint32(&cl.Properties.Will.Flag, 0)
+			cl.State.willCanceled.Store(true)
+		}
+
 		atomic.StoreInt64(&cl.State.disconnected, time.Now().Unix())
 	})
+}
+
+// stopSuppressesWill reports whether closing a client with err must delete the
+// will instead of publishing it.
+func stopSuppressesWill(err error) bool {
+	var code packets.Code
+	if !errors.As(err, &code) {
+		return false
+	}
+
+	switch code.Code {
+	case packets.CodeDisconnect.Code, packets.ErrSessionTakenOver.Code, packets.ErrServerShuttingDown.Code:
+		return true
+	default:
+		return false
+	}
 }
 
 // StopCause returns the reason the client connection was stopped, if any.

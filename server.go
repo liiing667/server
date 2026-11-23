@@ -6,6 +6,7 @@
 package mqtt
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"math"
@@ -15,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -154,6 +156,8 @@ type loop struct {
 	retainedExpiry *time.Ticker     // interval ticker for cleaning retained messages
 	willDelaySend  *time.Ticker     // interval ticker for sending Will Messages with a delay
 	willDelayed    *packets.Packets // activate LWT packets which will be sent after a delay
+	willOwners     map[string]*Client // the exact session which queued each delayed will
+	willMu         sync.Mutex         // guards willDelayed and willOwners together
 }
 
 // ops contains server values which can be propagated to other structs.
@@ -185,6 +189,7 @@ func New(opts *Options) *Server {
 			retainedExpiry: time.NewTicker(time.Second),
 			willDelaySend:  time.NewTicker(time.Second),
 			willDelayed:    packets.NewPackets(),
+			willOwners:     map[string]*Client{},
 		},
 		Options: opts,
 		Info: &system.Info{
@@ -449,20 +454,30 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 		return packets.ErrBadUsernameOrPassword
 	}
 
+	// Re-evaluate the will with the authenticated identity. A hook may have
+	// enriched the client in OnConnect, and an ACL denial here means the will
+	// is not admitted for this connection.
+	if cl.Properties.Will.Flag != 0 {
+		if !s.willAuthorized(cl, cl.Properties.Will.TopicName) {
+			cl.Properties.Will = Will{}
+			cl.State.willOrigin = ""
+		} else if cl.State.willOrigin == "" {
+			cl.State.willOrigin = cl.ID
+		}
+	}
+
 	atomic.AddInt64(&s.Info.ClientsConnected, 1)
 	defer atomic.AddInt64(&s.Info.ClientsConnected, -1)
 
 	s.hooks.OnSessionEstablish(cl, pk)
 
 	sessionPresent := s.inheritClientSession(pk, cl)
-	s.Clients.Add(cl) // [MQTT-4.1.0-1]
+	s.addClientSession(cl) // [MQTT-4.1.0-1]
 
 	err = s.SendConnack(cl, code, sessionPresent, nil) // [MQTT-3.1.4-5] [MQTT-3.2.0-1] [MQTT-3.2.0-2] &[MQTT-3.14.0-1]
 	if err != nil {
 		return fmt.Errorf("ack connection packet: %w", err)
 	}
-
-	s.loop.willDelayed.Delete(cl.ID) // [MQTT-3.1.3-9]
 
 	if sessionPresent {
 		err = cl.ResendInflightMessages(true)
@@ -479,6 +494,7 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 		cl.Stop(err)
 	} else {
 		cl.Properties.Will = Will{} // [MQTT-3.14.4-3] [MQTT-3.1.2-10]
+		cl.State.willCanceled.Store(true)
 	}
 	s.Log.Debug("client disconnected", "error", err, "client", cl.ID, "remote", cl.Net.Remote, "listener", listener)
 
@@ -486,6 +502,7 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 	s.hooks.OnDisconnect(cl, err, expire)
 
 	if expire && !cl.IsTakenOver() {
+		s.flushPendingWill(cl)
 		cl.ClearInflights()
 		s.UnsubscribeClient(cl)
 		s.Clients.Delete(cl.ID) // [MQTT-4.1.0-2] ![MQTT-3.1.2-23]
@@ -547,6 +564,10 @@ func (s *Server) validateConnect(cl *Client, pk packets.Packet) packets.Code {
 
 	if cl.Properties.ProtocolVersion < s.Options.Capabilities.MinimumProtocolVersion {
 		return packets.ErrUnsupportedProtocolVersion // [MQTT-3.1.2-2]
+	} else if cl.Properties.Will.Flag != 0 && cl.Properties.Will.TopicName == "" {
+		return packets.ErrProtocolViolationWillFlagNoPayload // [MQTT-3.1.2-9]
+	} else if cl.Properties.Will.Flag != 0 && !IsValidFilter(cl.Properties.Will.TopicName, true) {
+		return packets.ErrProtocolViolationSurplusWildcard // [MQTT-3.3.2-2]
 	} else if cl.Properties.Will.Qos > s.Options.Capabilities.MaximumQos {
 		return packets.ErrQosNotSupported // [MQTT-3.2.2-12]
 	} else if cl.Properties.Will.Retain && s.Options.Capabilities.RetainAvailable == 0x00 {
@@ -561,6 +582,10 @@ func (s *Server) validateConnect(cl *Client, pk packets.Packet) packets.Code {
 // session is abandoned.
 func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
 	if existing, ok := s.Clients.Get(cl.ID); ok {
+		// A new connection for this ClientID replaces the old session's will
+		// [MQTT-3.1.2-9]. Cancel it before disconnecting the old connection so
+		// the old connection's read loop cannot publish it after takeover.
+		s.cancelWill(existing)
 		_ = s.DisconnectClient(existing, packets.ErrSessionTakenOver)                                   // [MQTT-3.1.4-3]
 		if pk.Connect.Clean || (existing.Properties.Clean && existing.Properties.ProtocolVersion < 5) { // [MQTT-3.1.2-4] [MQTT-3.1.4-4]
 			s.UnsubscribeClient(existing)
@@ -601,6 +626,47 @@ func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
 	}
 
 	return false // [MQTT-3.2.2-2]
+}
+
+// addClientSession registers a new connection and, in the same critical
+// section, discards any will which an older session with the same ClientID
+// had queued. This prevents a delayed will from being attributed to the new
+// session.
+func (s *Server) addClientSession(cl *Client) {
+	if s.loop == nil {
+		s.Clients.Add(cl)
+		return
+	}
+
+	s.loop.willMu.Lock()
+	delete(s.loop.willOwners, cl.ID)
+	if s.loop.willDelayed != nil {
+		s.loop.willDelayed.Delete(cl.ID)
+	}
+	s.Clients.Add(cl)
+	s.loop.willMu.Unlock()
+}
+
+// cancelWill disarms cl's will and removes a delayed will owned by cl. A will
+// queued by a different session with the same ClientID is left alone.
+func (s *Server) cancelWill(cl *Client) {
+	if cl == nil {
+		return
+	}
+
+	if s.loop != nil {
+		s.loop.willMu.Lock()
+		if owner, ok := s.loop.willOwners[cl.ID]; !ok || owner == cl {
+			delete(s.loop.willOwners, cl.ID)
+			if s.loop.willDelayed != nil {
+				s.loop.willDelayed.Delete(cl.ID)
+			}
+		}
+		s.loop.willMu.Unlock()
+	}
+
+	atomic.StoreUint32(&cl.Properties.Will.Flag, 0)
+	cl.State.willCanceled.Store(true)
 }
 
 // SendConnack returns a Connack packet to a client.
@@ -1404,14 +1470,18 @@ func (s *Server) processDisconnect(cl *Client, pk packets.Packet) error {
 		return packets.CodeDisconnectWillMessage
 	}
 
-	s.loop.willDelayed.Delete(cl.ID) // [MQTT-3.1.3-9] [MQTT-3.1.2-8]
-	cl.Stop(packets.CodeDisconnect)  // [MQTT-3.14.4-2]
+	s.cancelWill(cl)                // [MQTT-3.1.3-9] [MQTT-3.1.2-8]
+	cl.Stop(packets.CodeDisconnect) // [MQTT-3.14.4-2]
 
 	return nil
 }
 
 // DisconnectClient sends a Disconnect packet to a client and then closes the client connection.
 func (s *Server) DisconnectClient(cl *Client, code packets.Code) error {
+	if stopSuppressesWill(code) {
+		s.cancelWill(cl)
+	}
+
 	out := packets.Packet{
 		FixedHeader: packets.FixedHeader{
 			Type: packets.Disconnect,
@@ -1497,6 +1567,7 @@ func (s *Server) Close() error {
 	close(s.done)
 	s.Log.Info("gracefully stopping server")
 	s.Listeners.CloseAll(s.closeListenerClients)
+	s.clearDelayedWills()
 	s.hooks.OnStopped()
 	s.hooks.Stop()
 
@@ -1504,21 +1575,79 @@ func (s *Server) Close() error {
 	return nil
 }
 
+// clearDelayedWills discards wills which were queued but not yet due. Server
+// shutdown is not a reason to publish another session's delayed will.
+func (s *Server) clearDelayedWills() {
+	if s.loop == nil {
+		return
+	}
+
+	s.loop.willMu.Lock()
+	if s.loop.willDelayed != nil {
+		for id := range s.loop.willDelayed.GetAll() {
+			s.loop.willDelayed.Delete(id)
+		}
+	}
+	s.loop.willOwners = map[string]*Client{}
+	s.loop.willMu.Unlock()
+}
+
 // closeListenerClients closes all clients on the specified listener.
 func (s *Server) closeListenerClients(listener string) {
 	clients := s.Clients.GetByListener(listener)
 	for _, cl := range clients {
+		s.cancelWill(cl)
 		_ = s.DisconnectClient(cl, packets.ErrServerShuttingDown)
 	}
 }
 
 // sendLWT issues an LWT message to a topic when a client disconnects.
 func (s *Server) sendLWT(cl *Client) {
-	if atomic.LoadUint32(&cl.Properties.Will.Flag) == 0 {
+	if cl == nil || cl.State.willCanceled.Load() || atomic.LoadUint32(&cl.Properties.Will.Flag) == 0 {
+		return
+	}
+	if s.closed() {
+		s.cancelWill(cl)
+		return
+	}
+
+	// A will belongs to the session which declared it. If that session has
+	// already been replaced by a new connection for the same ClientID, the
+	// old will must never be published or reported against the new session.
+	if cl.IsTakenOver() {
+		s.cancelWill(cl)
+		return
+	}
+	if current, ok := s.Clients.Get(cl.ID); ok && current != cl {
+		s.cancelWill(cl)
+		return
+	}
+
+	// sendLWT can be reached from more than one close path (for example a
+	// second CONNECT followed by the read loop exiting). Handle the will once.
+	if !cl.State.willPending.CompareAndSwap(false, true) {
+		return
+	}
+
+	// Re-check validity and publish permission at the moment of publication,
+	// not just at CONNECT. An ACL policy may have changed since the
+	// connection was admitted.
+	if cl.Properties.Will.TopicName == "" ||
+		!IsValidFilter(cl.Properties.Will.TopicName, true) ||
+		!s.willAuthorized(cl, cl.Properties.Will.TopicName) {
+		s.cancelWill(cl)
 		return
 	}
 
 	modifiedLWT := s.hooks.OnWill(cl, cl.Properties.Will)
+
+	// OnWill may rewrite the topic, so authorize the final topic too.
+	if modifiedLWT.TopicName == "" || !IsValidFilter(modifiedLWT.TopicName, true) ||
+		(modifiedLWT.TopicName != cl.Properties.Will.TopicName &&
+			!s.willAuthorized(cl, modifiedLWT.TopicName)) {
+		s.cancelWill(cl)
+		return
+	}
 
 	pk := packets.Packet{
 		FixedHeader: packets.FixedHeader{
@@ -1531,17 +1660,51 @@ func (s *Server) sendLWT(cl *Client) {
 		Properties: packets.Properties{
 			User: modifiedLWT.User,
 		},
-		Origin:  cl.ID,
-		Created: time.Now().Unix(),
+		Origin:          willOrigin(cl),
+		ProtocolVersion: cl.Properties.ProtocolVersion,
 	}
 
-	if cl.Properties.Will.WillDelayInterval > 0 {
-		pk.Connect.WillProperties.WillDelayInterval = cl.Properties.Will.WillDelayInterval
-		pk.Expiry = time.Now().Unix() + int64(pk.Connect.WillProperties.WillDelayInterval)
+	if pk.FixedHeader.Qos > s.Options.Capabilities.MaximumQos {
+		pk.FixedHeader.Qos = s.Options.Capabilities.MaximumQos
+	}
+	if pk.FixedHeader.Retain && s.Options.Capabilities.RetainAvailable == 0 {
+		pk.FixedHeader.Retain = false
+	}
+
+	delay := effectiveWillDelay(cl, modifiedLWT)
+	if delay > 0 {
+		pk.Created = time.Now().Unix()
+		pk.Connect.WillProperties.WillDelayInterval = delay
+		// Expiry is the due time for a queued will here. It is cleared before
+		// the will is turned into a PUBLISH so it is not mistaken for the
+		// message expiry interval.
+		pk.Expiry = pk.Created + int64(delay)
+
+		s.loop.willMu.Lock()
+		if cl.State.willCanceled.Load() || atomic.LoadUint32(&cl.Properties.Will.Flag) == 0 {
+			s.loop.willMu.Unlock()
+			return
+		}
+		if current, ok := s.Clients.Get(cl.ID); ok && current != cl {
+			atomic.StoreUint32(&cl.Properties.Will.Flag, 0)
+			cl.State.willCanceled.Store(true)
+			s.loop.willMu.Unlock()
+			return
+		}
+		if s.loop.willOwners == nil {
+			s.loop.willOwners = map[string]*Client{}
+		}
 		s.loop.willDelayed.Add(cl.ID, pk)
+		s.loop.willOwners[cl.ID] = cl
+		s.loop.willMu.Unlock()
 		return
 	}
 
+	if cl.State.willCanceled.Load() || atomic.LoadUint32(&cl.Properties.Will.Flag) == 0 {
+		return
+	}
+
+	pk.Created = time.Now().Unix()
 	if pk.FixedHeader.Retain {
 		s.retainMessage(cl, pk)
 	}
@@ -1549,6 +1712,59 @@ func (s *Server) sendLWT(cl *Client) {
 	s.publishToSubscribers(pk)                      // [MQTT-3.1.2-8]
 	atomic.StoreUint32(&cl.Properties.Will.Flag, 0) // [MQTT-3.1.2-10]
 	s.hooks.OnWillSent(cl, pk)
+}
+
+// willOrigin returns the publishing identity frozen when the will was
+// admitted. Manual clients which set Will without ParseConnect fall back to
+// their current ClientID.
+func willOrigin(cl *Client) string {
+	if cl.State.willOrigin != "" {
+		return cl.State.willOrigin
+	}
+
+	return cl.ID
+}
+
+// effectiveWillDelay returns the will delay actually available to a session.
+// A v5 will cannot outlive its session. MQTT v3 has no Will Delay property,
+// so any value carried by an existing caller is left as it was.
+func effectiveWillDelay(cl *Client, will Will) uint32 {
+	if cl.Properties.ProtocolVersion < 5 {
+		return will.WillDelayInterval
+	}
+	if cl.State.willOrigin == "" && !cl.Properties.Props.SessionExpiryIntervalFlag {
+		// A client built directly by an embedding application (rather than
+		// through ParseConnect) keeps the legacy delay value. Real v5
+		// connections always have an admitted origin, so they are bounded by
+		// their session expiry.
+		return will.WillDelayInterval
+	}
+
+	delay := will.WillDelayInterval
+	sessionExpiry := cl.Properties.Props.SessionExpiryInterval
+	if cl.ops != nil && cl.ops.options != nil && cl.ops.options.Capabilities != nil {
+		if maxExpiry := cl.ops.options.Capabilities.MaximumSessionExpiryInterval; maxExpiry > 0 && sessionExpiry > maxExpiry {
+			sessionExpiry = maxExpiry
+		}
+	}
+	if delay > sessionExpiry {
+		delay = sessionExpiry
+	}
+
+	return delay
+}
+
+// willAuthorized evaluates the current write ACL for a will topic. Servers
+// without an ACL hook have nothing to enforce and keep the legacy behaviour.
+func (s *Server) willAuthorized(cl *Client, topic string) bool {
+	if cl == nil || cl.Net.Inline {
+		return true
+	}
+	if s.hooks == nil || !s.hooks.Provides(OnACLCheck) {
+		return true
+	}
+
+	return s.hooks.OnACLCheck(cl, topic, true)
 }
 
 // readStore reads in any data from the persistent datastore (if applicable).
@@ -1671,7 +1887,7 @@ func (s *Server) loadClients(v []storage.Client) {
 			cl.ClearInflights()
 			s.UnsubscribeClient(cl)
 		} else {
-			s.Clients.Add(cl)
+			s.addClientSession(cl)
 		}
 	}
 }
@@ -1708,9 +1924,50 @@ func (s *Server) clearExpiredClients(dt int64) {
 
 		if disconnected+int64(expire) < dt {
 			s.hooks.OnClientExpired(client)
+			s.flushPendingWill(client)
 			s.Clients.Delete(id) // [MQTT-4.1.0-2]
 		}
 	}
+}
+
+// flushPendingWill publishes a queued will early when its session ends before
+// the Will Delay Interval has elapsed [MQTT-3.1.2.11].
+func (s *Server) flushPendingWill(cl *Client) {
+	if cl == nil {
+		return
+	}
+	if s.loop == nil || s.loop.willDelayed == nil {
+		return
+	}
+
+	s.loop.willMu.Lock()
+	owner, ownerOK := s.loop.willOwners[cl.ID]
+	pk, ok := s.loop.willDelayed.Get(cl.ID)
+	if !ok || (ownerOK && owner != cl) {
+		s.loop.willMu.Unlock()
+		return
+	}
+	delete(s.loop.willOwners, cl.ID)
+	s.loop.willDelayed.Delete(cl.ID)
+	s.loop.willMu.Unlock()
+
+	if cl.State.willCanceled.Load() || atomic.LoadUint32(&cl.Properties.Will.Flag) == 0 {
+		return
+	}
+	if current, ok := s.Clients.Get(cl.ID); ok && current != cl {
+		return
+	}
+	if cl.IsTakenOver() {
+		atomic.StoreUint32(&cl.Properties.Will.Flag, 0)
+		cl.State.willCanceled.Store(true)
+		return
+	}
+	if !s.willAuthorized(cl, pk.TopicName) {
+		s.cancelWill(cl)
+		return
+	}
+
+	s.publishWill(cl, pk)
 }
 
 // clearExpiredRetainedMessage deletes retained messages from topics if they have expired.
@@ -1743,18 +2000,119 @@ func (s *Server) clearExpiredInflights(now int64) {
 
 // sendDelayedLWT sends any LWT messages which have reached their issue time.
 func (s *Server) sendDelayedLWT(dt int64) {
+	if s.closed() {
+		return
+	}
+	if s.loop == nil || s.loop.willDelayed == nil {
+		return
+	}
+
+	type delayedWill struct {
+		id     string
+		client *Client
+		packet packets.Packet
+	}
+
+	s.loop.willMu.Lock()
+	due := make([]delayedWill, 0)
 	for id, pk := range s.loop.willDelayed.GetAll() {
-		if dt > pk.Expiry {
-			s.publishToSubscribers(pk) // [MQTT-3.1.2-8]
-			if cl, ok := s.Clients.Get(id); ok {
-				if pk.FixedHeader.Retain {
-					s.retainMessage(cl, pk)
-				}
-				cl.Properties.Will = Will{} // [MQTT-3.1.2-10]
-				s.hooks.OnWillSent(cl, pk)
-			}
-			s.loop.willDelayed.Delete(id)
+		if dt < pk.Expiry {
+			continue
 		}
+		due = append(due, delayedWill{
+			id:     id,
+			client: s.loop.willOwners[id],
+			packet: pk,
+		})
+		delete(s.loop.willOwners, id)
+		s.loop.willDelayed.Delete(id)
+	}
+	s.loop.willMu.Unlock()
+
+	for _, item := range due {
+		cl := item.client
+		if cl == nil {
+			// A will queued through sendLWT always carries its owning
+			// session. An unbound packet must not be attributed to whichever
+			// session happens to hold this ClientID now, because that may be
+			// a replacement. It is only compatible with a current session
+			// whose admitted will is exactly the same message.
+			if current, ok := s.Clients.Get(item.id); ok {
+				if current.Properties.Will.Flag == 0 ||
+					current.Properties.Will.TopicName != item.packet.TopicName ||
+					!bytes.Equal(current.Properties.Will.Payload, item.packet.Payload) {
+					continue
+				}
+				cl = current
+			}
+			// With no session at all, retain the legacy embedding behaviour
+			// of publishing the unbound packet.
+		}
+		if item.packet.TopicName == "" || !IsValidFilter(item.packet.TopicName, true) {
+			if cl != nil {
+				s.cancelWill(cl)
+			}
+			continue
+		}
+
+		if cl != nil {
+			if cl.State.willCanceled.Load() || atomic.LoadUint32(&cl.Properties.Will.Flag) == 0 {
+				continue
+			}
+			if cl.IsTakenOver() {
+				atomic.StoreUint32(&cl.Properties.Will.Flag, 0)
+				cl.State.willCanceled.Store(true)
+				continue
+			}
+			// A new connection for this ClientID owns the session now. The old
+			// will must not be published or reported against it.
+			if current, ok := s.Clients.Get(item.id); ok && current != cl {
+				atomic.StoreUint32(&cl.Properties.Will.Flag, 0)
+				cl.State.willCanceled.Store(true)
+				continue
+			}
+			if !s.willAuthorized(cl, item.packet.TopicName) {
+				s.cancelWill(cl)
+				continue
+			}
+		}
+
+		s.publishWill(cl, item.packet) // [MQTT-3.1.2-8]
+	}
+}
+
+// closed reports whether the server is shutting down.
+func (s *Server) closed() bool {
+	if s.done == nil {
+		return false
+	}
+
+	select {
+	case <-s.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// publishWill turns a queued will into a PUBLISH, retaining it first if
+// requested, and reports it against the session which declared the will.
+func (s *Server) publishWill(cl *Client, pk packets.Packet) {
+	if s.closed() {
+		return
+	}
+
+	pk.Created = time.Now().Unix()
+	pk.Expiry = 0 // a queued will stores its deadline in Expiry
+	if pk.FixedHeader.Retain && cl != nil {
+		s.retainMessage(cl, pk)
+	}
+
+	s.publishToSubscribers(pk)
+	if cl != nil {
+		atomic.StoreUint32(&cl.Properties.Will.Flag, 0) // [MQTT-3.1.2-10]
+		cl.State.willCanceled.Store(true)
+		s.hooks.OnWillSent(cl, pk)
 	}
 }
 
