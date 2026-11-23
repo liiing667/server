@@ -407,7 +407,10 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 	defer s.Listeners.ClientsWg.Done()
 	s.Listeners.ClientsWg.Add(1)
 
-	go cl.WriteLoop()
+	// Topic aliases and the write consumer are connection-scoped. They are
+	// started/bound only after the CONNECT packet has established this
+	// connection's generation, client id, and alias tables.
+	defer cl.State.TopicAliases.Clear() // [MQTT-3.3.2-7]
 	defer cl.Stop(nil)
 
 	pk, err := s.readConnectionPacket(cl)
@@ -416,6 +419,7 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 	}
 
 	cl.ParseConnect(listener, pk)
+	go cl.WriteLoop()
 	if atomic.LoadInt64(&s.Info.ClientsConnected) >= s.Options.Capabilities.MaximumClients {
 		if cl.Properties.ProtocolVersion < 5 {
 			s.SendConnack(cl, packets.ErrServerUnavailable, false, nil)
@@ -561,8 +565,15 @@ func (s *Server) validateConnect(cl *Client, pk packets.Packet) packets.Code {
 // session is abandoned.
 func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
 	if existing, ok := s.Clients.Get(cl.ID); ok {
+		abandon := pk.Connect.Clean || (existing.Properties.Clean && existing.Properties.ProtocolVersion < 5)
+		var inherited *Inflight
+		if !abandon {
+			inherited = s.inheritInflights(existing)
+		}
+
 		_ = s.DisconnectClient(existing, packets.ErrSessionTakenOver)                                   // [MQTT-3.1.4-3]
-		if pk.Connect.Clean || (existing.Properties.Clean && existing.Properties.ProtocolVersion < 5) { // [MQTT-3.1.2-4] [MQTT-3.1.4-4]
+		existing.State.TopicAliases.Clear()                                                             // [MQTT-3.3.2-7]
+		if abandon {                                                                                    // [MQTT-3.1.2-4] [MQTT-3.1.4-4]
 			s.UnsubscribeClient(existing)
 			existing.ClearInflights()
 			existing.State.isTakenOver.Store(true) // only set isTakenOver after unsubscribe has occurred
@@ -570,8 +581,8 @@ func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
 		}
 
 		existing.State.isTakenOver.Store(true)
-		if existing.State.Inflight.Len() > 0 {
-			cl.State.Inflight = existing.State.Inflight.Clone() // [MQTT-3.1.2-5]
+		if inherited != nil && inherited.Len() > 0 {
+			cl.State.Inflight = inherited // [MQTT-3.1.2-5]
 			if cl.State.Inflight.maximumReceiveQuota == 0 && cl.ops.options.Capabilities.ReceiveMaximum != 0 {
 				cl.State.Inflight.ResetReceiveQuota(int32(cl.ops.options.Capabilities.ReceiveMaximum)) // server receive max per client
 				cl.State.Inflight.ResetSendQuota(int32(cl.Properties.Props.ReceiveMaximum))            // client receive max
@@ -601,6 +612,43 @@ func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
 	}
 
 	return false // [MQTT-3.2.2-2]
+}
+
+// inheritInflights clones a session's in-flight packets for a new network
+// connection. Topic aliases do not cross connections [MQTT-3.3.2-7], so any
+// alias recorded by the previous connection is resolved back to its topic and
+// removed from the inherited packet. Sending an old alias on the new
+// connection would either be an unknown alias to the client or, worse, collide
+// with an alias the server assigns there for a different topic.
+func (s *Server) inheritInflights(existing *Client) *Inflight {
+	if existing.State.Inflight.Len() == 0 {
+		return nil
+	}
+
+	inherited := existing.State.Inflight.Clone()
+	for _, pk := range inherited.GetAll(false) {
+		if !pk.Properties.TopicAliasFlag && pk.Properties.TopicAlias == 0 {
+			continue
+		}
+
+		if pk.TopicName == "" {
+			if topic, ok := existing.State.TopicAliases.Outbound.Topic(pk.Properties.TopicAlias); ok {
+				pk.TopicName = topic
+			}
+		}
+
+		pk.Properties.TopicAlias = 0
+		pk.Properties.TopicAliasFlag = false
+		pk.Mods.ConnectionGeneration = 0
+		if pk.TopicName == "" {
+			inherited.Delete(pk.PacketID)
+			continue
+		}
+
+		inherited.Set(pk)
+	}
+
+	return inherited
 }
 
 // SendConnack returns a Connack packet to a client.
@@ -902,8 +950,15 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 		}
 	}
 
-	if pk.Properties.TopicAliasFlag && pk.Properties.TopicAlias > 0 { // [MQTT-3.3.2-11]
+	if cl.Properties.ProtocolVersion == 5 && pk.Properties.TopicAliasFlag && pk.Properties.TopicAlias > 0 { // [MQTT-3.3.2-11]
 		pk.TopicName = cl.State.TopicAliases.Inbound.Set(pk.Properties.TopicAlias, pk.TopicName)
+		if pk.TopicName == "" {
+			// An alias with no topic name which this connection never
+			// registered is a Protocol Error [MQTT-3.3.2-7] [MQTT-3.3.2-8].
+			// Aliases belong to the connection that registered them, so a
+			// client reconnecting and reusing a stale alias lands here.
+			return s.DisconnectClient(cl, packets.ErrProtocolViolationNoTopic)
+		}
 	}
 
 	if pk.FixedHeader.Qos > s.Options.Capabilities.MaximumQos {
@@ -1050,9 +1105,11 @@ func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packet
 		out.FixedHeader.Qos = s.Options.Capabilities.MaximumQos // [MQTT-3.2.2-9]
 	}
 
-	if cl.Properties.Props.TopicAliasMaximum > 0 {
+	fullTopic := out.TopicName
+	online := cl.Net.Conn != nil && !cl.Closed()
+	if online && cl.Properties.ProtocolVersion == 5 && cl.Properties.Props.TopicAliasMaximum > 0 {
 		var aliasExists bool
-		out.Properties.TopicAlias, aliasExists = cl.State.TopicAliases.Outbound.Set(pk.TopicName)
+		out.Properties.TopicAlias, aliasExists = cl.State.TopicAliases.Outbound.Set(fullTopic)
 		if out.Properties.TopicAlias > 0 {
 			out.Properties.TopicAliasFlag = true
 			if aliasExists {
@@ -1080,7 +1137,17 @@ func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packet
 		out.PacketID = uint16(i) // [MQTT-2.2.1-4]
 		sentQuota := atomic.LoadInt32(&cl.State.Inflight.sendQuota)
 
-		if ok := cl.State.Inflight.Set(out); ok { // [MQTT-4.3.2-3] [MQTT-4.3.3-3]
+		// In-flight packets outlive a network connection, so they retain
+		// the complete topic and never an alias from the connection that
+		// sent them. The alias to use on the wire is chosen again by the
+		// connection which ultimately writes the packet.
+		inflight := out
+		inflight.TopicName = fullTopic
+		inflight.Properties.TopicAlias = 0
+		inflight.Properties.TopicAliasFlag = false
+		inflight.Mods.ConnectionGeneration = 0
+
+		if ok := cl.State.Inflight.Set(inflight); ok { // [MQTT-4.3.2-3] [MQTT-4.3.3-3]
 			atomic.AddInt64(&s.Info.Inflight, 1)
 			s.hooks.OnQosPublish(cl, out, out.Created, 0)
 			cl.State.Inflight.DecreaseSendQuota()
@@ -1088,7 +1155,8 @@ func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packet
 
 		if sentQuota == 0 && atomic.LoadInt32(&cl.State.Inflight.maximumSendQuota) > 0 {
 			out.Expiry = -1
-			cl.State.Inflight.Set(out)
+			inflight.Expiry = -1
+			cl.State.Inflight.Set(inflight)
 			return out, nil
 		}
 	}
@@ -1097,6 +1165,7 @@ func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packet
 		return out, packets.CodeDisconnect
 	}
 
+	out.Mods.ConnectionGeneration = cl.Generation()
 	select {
 	case cl.State.outbound <- &out:
 		atomic.AddInt32(&cl.State.outboundQty, 1)

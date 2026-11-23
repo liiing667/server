@@ -31,6 +31,19 @@ func NewTopicAliases(topicAliasMaximum uint16) TopicAliases {
 	}
 }
 
+// Clear removes every topic alias binding from both tables. Topic alias
+// bindings belong to a single network connection, so they must not survive a
+// disconnect, a clean start, or a takeover by another connection using the
+// same client id.
+func (a *TopicAliases) Clear() {
+	if a == nil {
+		return
+	}
+
+	a.Inbound.Clear()
+	a.Outbound.Clear()
+}
+
 // NewInboundTopicAliases returns a pointer to InboundTopicAliases.
 func NewInboundTopicAliases(topicAliasMaximum uint16) *InboundTopicAliases {
 	return &InboundTopicAliases{
@@ -55,12 +68,23 @@ func (a *InboundTopicAliases) Set(id uint16, topic string) string {
 		return topic // ?
 	}
 
-	if existing, ok := a.internal[id]; ok && topic == "" {
-		return existing
+	if topic == "" {
+		return a.internal[id] // empty if this connection never registered the alias
 	}
 
 	a.internal[id] = topic
 	return topic
+}
+
+// Clear removes all inbound topic alias bindings.
+func (a *InboundTopicAliases) Clear() {
+	if a == nil {
+		return
+	}
+
+	a.Lock()
+	defer a.Unlock()
+	a.internal = map[uint16]string{}
 }
 
 // OutboundTopicAliases contains a map of topic aliases sent from the broker to the client.
@@ -102,6 +126,35 @@ func (a *OutboundTopicAliases) Set(topic string) (uint16, bool) {
 	a.internal[topic] = uint16(i) + 1
 	atomic.StoreUint32(&a.cursor, i+1)
 	return uint16(i) + 1, false
+}
+
+// Topic returns the topic bound to an outbound alias, if any.
+func (a *OutboundTopicAliases) Topic(alias uint16) (string, bool) {
+	if a == nil {
+		return "", false
+	}
+
+	a.RLock()
+	defer a.RUnlock()
+	for topic, id := range a.internal {
+		if id == alias {
+			return topic, true
+		}
+	}
+
+	return "", false
+}
+
+// Clear removes all outbound topic alias bindings and resets the alias cursor.
+func (a *OutboundTopicAliases) Clear() {
+	if a == nil {
+		return
+	}
+
+	a.Lock()
+	defer a.Unlock()
+	a.internal = map[string]uint16{}
+	atomic.StoreUint32(&a.cursor, 0)
 }
 
 // SharedSubscriptions contains a map of subscriptions to a shared filter,

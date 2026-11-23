@@ -142,9 +142,10 @@ type Packet struct {
 
 // Mods specifies certain values required for certain mqtt v5 compliance within packet encoding/decoding.
 type Mods struct {
-	MaxSize             uint32 // the maximum packet size specified by the client / server
-	DisallowProblemInfo bool   // if problem info is disallowed
-	AllowResponseInfo   bool   // if response info is disallowed
+	MaxSize              uint32 // the maximum packet size specified by the client / server
+	ConnectionGeneration uint64 // internal: the client connection generation this packet belongs to
+	DisallowProblemInfo  bool   // if problem info is disallowed
+	AllowResponseInfo    bool   // if response info is disallowed
 }
 
 // ConnectParams contains packet values which are specifically related to connect packets.

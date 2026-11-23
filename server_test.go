@@ -2255,6 +2255,118 @@ func TestProcessPublishWithTopicAlias(t *testing.T) {
 	require.Equal(t, packets.TPacketData[packets.Publish].Get(packets.TPublishBasic).RawBytes, buf)
 }
 
+func TestProcessPublishWithUnregisteredTopicAlias(t *testing.T) {
+	s := newServer()
+	cl, _, _ := newTestClient()
+	cl.Properties.ProtocolVersion = 5
+	cl.Net.Conn = nil // the disconnect is what this test inspects
+	s.Clients.Add(cl)
+
+	pkx := *packets.TPacketData[packets.Publish].Get(packets.TPublishMqtt5).Packet
+	pkx.Properties.SubscriptionIdentifier = []int{}
+	pkx.TopicName = ""
+	pkx.Properties.TopicAliasFlag = true
+	pkx.Properties.TopicAlias = 1
+
+	err := s.processPacket(cl, pkx)
+	require.ErrorIs(t, err, packets.ErrProtocolViolationNoTopic)
+
+	// The failed lookup must not leave an alias bound to the empty topic.
+	require.NotContains(t, cl.State.TopicAliases.Inbound.internal, uint16(1))
+	require.Equal(t, 0, len(s.Topics.Messages("")))
+}
+
+func TestInheritInflightsDropsOldConnectionAlias(t *testing.T) {
+	s := newServer()
+
+	existing, _, _ := newTestClient()
+	existing.Net.Conn = nil
+	existing.ID = "alias-takeover"
+	existing.Properties.ProtocolVersion = 5
+	existing.Properties.Props.TopicAliasMaximum = 5
+	existing.State.TopicAliases.Outbound.Set("old/connection/topic")
+	existing.State.Inflight.Set(packets.Packet{
+		FixedHeader: packets.FixedHeader{Type: packets.Publish, Qos: 1},
+		PacketID:    1,
+		TopicName:   "",
+		Properties: packets.Properties{
+			TopicAlias:     1,
+			TopicAliasFlag: true,
+		},
+		Mods: packets.Mods{ConnectionGeneration: 1},
+	})
+	s.Clients.Add(existing)
+
+	cl, _, _ := newTestClient()
+	cl.Properties.ProtocolVersion = 5
+	cl.ParseConnect("tcp2", packets.Packet{
+		ProtocolVersion: 5,
+		Connect: packets.ConnectParams{
+			ClientIdentifier: existing.ID,
+		},
+		Properties: packets.Properties{TopicAliasMaximum: 5},
+	})
+
+	sessionPresent := s.inheritClientSession(packets.Packet{
+		Connect: packets.ConnectParams{ClientIdentifier: existing.ID},
+	}, cl)
+	require.True(t, sessionPresent)
+
+	inherited, ok := cl.State.Inflight.Get(1)
+	require.True(t, ok)
+	require.Equal(t, "old/connection/topic", inherited.TopicName)
+	require.False(t, inherited.Properties.TopicAliasFlag)
+	require.Zero(t, inherited.Properties.TopicAlias)
+	require.Zero(t, inherited.Mods.ConnectionGeneration)
+	t.Logf("connection 2 inherited alias 1 -> %q without an alias property", inherited.TopicName)
+
+	// The old connection's mapping is gone with the old connection.
+	require.Empty(t, existing.State.TopicAliases.Inbound.internal)
+	require.Empty(t, existing.State.TopicAliases.Outbound.internal)
+	require.Empty(t, cl.State.TopicAliases.Inbound.internal)
+	require.Empty(t, cl.State.TopicAliases.Outbound.internal)
+}
+
+func TestPublishToClientMqtt3HasNoTopicAlias(t *testing.T) {
+	s := newServer()
+	cl, _, _ := newTestClient()
+	cl.Properties.ProtocolVersion = 4
+	cl.Properties.Props.TopicAliasMaximum = 5 // even if a caller sets this
+	cl.Net.Conn = nil
+
+	pkx := *packets.TPacketData[packets.Publish].Get(packets.TPublishBasic).Packet
+	out, err := s.publishToClient(cl, packets.Subscription{Filter: pkx.TopicName}, pkx)
+	require.ErrorIs(t, err, packets.CodeDisconnect)
+	require.False(t, out.Properties.TopicAliasFlag)
+	require.Zero(t, out.Properties.TopicAlias)
+	require.Equal(t, pkx.TopicName, out.TopicName)
+}
+
+func TestPublishToClientInflightKeepsFullTopicWithoutAlias(t *testing.T) {
+	s := newServer()
+	cl, _, w := newTestClient()
+	defer w.Close()
+	cl.Properties.ProtocolVersion = 5
+	cl.Properties.Props.TopicAliasMaximum = 5
+	s.Clients.Add(cl)
+
+	pkx := *packets.TPacketData[packets.Publish].Get(packets.TPublishQos1).Packet
+	for i := 0; i < 2; i++ {
+		_, err := s.publishToClient(cl, packets.Subscription{Filter: pkx.TopicName, Qos: 1}, pkx)
+		require.NoError(t, err)
+	}
+
+	for _, inflight := range cl.State.Inflight.GetAll(false) {
+		require.Equal(t, pkx.TopicName, inflight.TopicName)
+		require.False(t, inflight.Properties.TopicAliasFlag)
+		require.Zero(t, inflight.Properties.TopicAlias)
+		require.Zero(t, inflight.Mods.ConnectionGeneration)
+	}
+
+	// The wire packets still use and then reuse the alias.
+	require.Equal(t, uint16(1), cl.State.TopicAliases.Outbound.internal[pkx.TopicName])
+}
+
 func TestPublishToSubscribersExhaustedSendQuota(t *testing.T) {
 	s := newServer()
 	cl, r, w := newTestClient()

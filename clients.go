@@ -151,6 +151,7 @@ type ClientState struct {
 	outbound        chan *packets.Packet // queue for pending outbound packets
 	endOnce         sync.Once            // only end once
 	isTakenOver     atomic.Bool          // used to identify orphaned clients
+	generation      uint64               // the current network connection generation
 	packetID        uint32               // the current highest packetID
 	open            context.Context      // indicate that the client is open for packet exchange
 	cancelOpen      context.CancelFunc   // cancel function for open context
@@ -195,6 +196,13 @@ func (cl *Client) WriteLoop() {
 	for {
 		select {
 		case pk := <-cl.State.outbound:
+			if !cl.acceptsOutbound(pk) {
+				// A packet queued for an earlier network connection must
+				// never be written to the current connection.
+				atomic.AddInt32(&cl.State.outboundQty, -1)
+				continue
+			}
+
 			if err := cl.WritePacket(*pk); err != nil {
 				// TODO : Figure out what to do with error
 				cl.ops.log.Debug("failed publishing packet", "error", err, "client", cl.ID, "packet", pk)
@@ -206,10 +214,56 @@ func (cl *Client) WriteLoop() {
 	}
 }
 
+// Generation returns the generation of the network connection this client is
+// currently serving. It is incremented whenever a new connection is bound to
+// the client, so packets queued by an earlier connection can be rejected by
+// the write loop of the current one.
+func (cl *Client) Generation() uint64 {
+	return atomic.LoadUint64(&cl.State.generation)
+}
+
+// acceptsOutbound returns true if pk belongs to the current connection
+// generation. A zero generation is treated as belonging to the current
+// connection for packets constructed by callers and tests which do not bind
+// a connection explicitly.
+func (cl *Client) acceptsOutbound(pk *packets.Packet) bool {
+	if pk == nil || pk.Mods.ConnectionGeneration == 0 {
+		return true
+	}
+
+	return pk.Mods.ConnectionGeneration == cl.Generation()
+}
+
+// beginConnection binds a new network connection to the client. The
+// connection generation, client id, and both topic alias tables are switched
+// together as one unit, so no packet, alias lookup, or writer can observe a
+// new connection with state left behind by an earlier one.
+func (cl *Client) beginConnection(lid string, pk packets.Packet) {
+	cl.Lock()
+	defer cl.Unlock()
+
+	cl.Net.Listener = lid
+	cl.State.TopicAliases = NewTopicAliases(cl.ops.options.Capabilities.TopicAliasMaximum)
+	outboundMaximum := pk.Properties.TopicAliasMaximum
+	if pk.ProtocolVersion < 5 {
+		outboundMaximum = 0 // [MQTT-3.3.2-7] topic aliases do not exist in MQTT 3
+	}
+	cl.State.TopicAliases.Outbound = NewOutboundTopicAliases(outboundMaximum)
+
+	cl.ID = pk.Connect.ClientIdentifier
+	if cl.ID == "" {
+		cl.ID = xid.New().String() // [MQTT-3.1.3-6] [MQTT-3.1.3-7]
+		cl.Properties.Props.AssignedClientID = cl.ID
+	}
+
+	// Publish the generation last: a packet stamped with the new generation
+	// cannot be queued until the client id and both alias tables above are in
+	// place, and every packet stamped with the old one is now stale.
+	atomic.AddUint64(&cl.State.generation, 1)
+}
+
 // ParseConnect parses the connect parameters and properties for a client.
 func (cl *Client) ParseConnect(lid string, pk packets.Packet) {
-	cl.Net.Listener = lid
-
 	cl.Properties.ProtocolVersion = pk.ProtocolVersion
 	cl.Properties.Username = pk.Connect.Username
 	cl.Properties.Clean = pk.Connect.Clean
@@ -231,13 +285,7 @@ func (cl *Client) ParseConnect(lid string, pk packets.Packet) {
 	cl.State.Keepalive = pk.Connect.Keepalive                                              // [MQTT-3.2.2-22]
 	cl.State.Inflight.ResetReceiveQuota(int32(cl.ops.options.Capabilities.ReceiveMaximum)) // server receive max per client
 	cl.State.Inflight.ResetSendQuota(int32(cl.Properties.Props.ReceiveMaximum))            // client receive max
-	cl.State.TopicAliases.Outbound = NewOutboundTopicAliases(cl.Properties.Props.TopicAliasMaximum)
-
-	cl.ID = pk.Connect.ClientIdentifier
-	if cl.ID == "" {
-		cl.ID = xid.New().String() // [MQTT-3.1.3-6] [MQTT-3.1.3-7]
-		cl.Properties.Props.AssignedClientID = cl.ID
-	}
+	cl.beginConnection(lid, pk)
 
 	if pk.Connect.WillFlag {
 		cl.Properties.Will = Will{
@@ -307,6 +355,27 @@ func (cl *Client) ResendInflightMessages(force bool) error {
 	}
 
 	for _, tk := range cl.State.Inflight.GetAll(false) {
+		// An alias is only meaningful on the connection which registered
+		// it [MQTT-3.3.2-7]. Resend the complete topic instead, and drop
+		// an inherited packet whose topic cannot be recovered.
+		if tk.Properties.TopicAliasFlag || tk.Properties.TopicAlias > 0 {
+			if tk.TopicName == "" {
+				if topic, ok := cl.State.TopicAliases.Outbound.Topic(tk.Properties.TopicAlias); ok {
+					tk.TopicName = topic
+				}
+			}
+
+			tk.Properties.TopicAlias = 0
+			tk.Properties.TopicAliasFlag = false
+			if tk.TopicName == "" && tk.FixedHeader.Type == packets.Publish {
+				if ok := cl.State.Inflight.Delete(tk.PacketID); ok {
+					cl.ops.hooks.OnQosDropped(cl, tk)
+					atomic.AddInt64(&cl.ops.info.Inflight, -1)
+				}
+				continue
+			}
+		}
+
 		if tk.FixedHeader.Type == packets.Publish {
 			tk.FixedHeader.Dup = true // [MQTT-3.3.1-1] [MQTT-3.3.1-3]
 		}
@@ -404,6 +473,9 @@ func (cl *Client) Stop(err error) {
 		if cl.State.cancelOpen != nil {
 			cl.State.cancelOpen()
 		}
+
+		// Topic aliases belong to this network connection and die with it.
+		cl.State.TopicAliases.Clear() // [MQTT-3.3.2-7]
 
 		atomic.StoreInt64(&cl.State.disconnected, time.Now().Unix())
 	})

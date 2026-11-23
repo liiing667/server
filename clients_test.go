@@ -254,6 +254,67 @@ func TestClientParseConnectNoID(t *testing.T) {
 	require.NotEmpty(t, cl.ID)
 }
 
+func TestTopicAliasesSwitchWithConnection(t *testing.T) {
+	cl, _, _ := newTestClient()
+
+	connect := func(listener string) {
+		cl.ParseConnect(listener, packets.Packet{
+			ProtocolVersion: 5,
+			Connect: packets.ConnectParams{
+				ClientIdentifier: "alias-lifecycle",
+			},
+			Properties: packets.Properties{
+				TopicAliasMaximum: 5,
+			},
+		})
+	}
+
+	connect("tcp1")
+	firstGeneration := cl.Generation()
+
+	// A first registration binds the alias. A following publish with an
+	// empty topic resolves it, and another non-empty topic overwrites it.
+	require.Equal(t, "first/topic", cl.State.TopicAliases.Inbound.Set(1, "first/topic"))
+	first := cl.State.TopicAliases.Inbound.Set(1, "")
+	require.Equal(t, "first/topic", first)
+	require.Equal(t, "replaced/topic", cl.State.TopicAliases.Inbound.Set(1, "replaced/topic"))
+	require.Equal(t, "replaced/topic", cl.State.TopicAliases.Inbound.Set(1, ""))
+
+	firstAlias, existed := cl.State.TopicAliases.Outbound.Set("first/topic")
+	require.False(t, existed)
+	require.Equal(t, uint16(1), firstAlias)
+	t.Logf("connection 1 (generation %d): inbound alias 1 -> %q, outbound alias %d -> %q",
+		firstGeneration, first, firstAlias, "first/topic")
+
+	// A second connection using the same client id must not see any alias
+	// from the first one, in either direction.
+	connect("tcp2")
+	require.Greater(t, cl.Generation(), firstGeneration)
+	require.Equal(t, "alias-lifecycle", cl.ID)
+	require.Empty(t, cl.State.TopicAliases.Inbound.Set(1, ""))
+	require.Empty(t, cl.State.TopicAliases.Inbound.internal)
+	require.Empty(t, cl.State.TopicAliases.Outbound.internal)
+	require.Equal(t, uint32(0), cl.State.TopicAliases.Outbound.cursor)
+
+	require.Equal(t, "second/topic", cl.State.TopicAliases.Inbound.Set(1, "second/topic"))
+	second := cl.State.TopicAliases.Inbound.Set(1, "")
+	require.Equal(t, "second/topic", second)
+	secondAlias, existed := cl.State.TopicAliases.Outbound.Set("second/topic")
+	require.False(t, existed)
+	require.Equal(t, uint16(1), secondAlias)
+	t.Logf("connection 2 (generation %d): inbound alias 1 -> %q, outbound alias %d -> %q",
+		cl.Generation(), second, secondAlias, "second/topic")
+}
+
+func TestInboundAliasUnregisteredAfterClear(t *testing.T) {
+	a := NewInboundTopicAliases(5)
+	require.Equal(t, "first/topic", a.Set(1, "first/topic"))
+
+	a.Clear()
+	require.Equal(t, "", a.Set(1, ""))
+	require.NotContains(t, a.internal, uint16(1))
+}
+
 func TestClientParseConnectBelowMinimumKeepalive(t *testing.T) {
 	cl, _, _ := newTestClient()
 	var b bytes.Buffer
