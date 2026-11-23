@@ -307,6 +307,23 @@ func (cl *Client) ResendInflightMessages(force bool) error {
 	}
 
 	for _, tk := range cl.State.Inflight.GetAll(false) {
+		// A retry is still a delivery under this client's identity. If read
+		// access to the actual topic is gone (for example after a reconnect
+		// with another identity, or after an ACL change), a queued publish
+		// must not be sent just because it was authorized when first queued.
+		// An empty topic name here means the packet was reduced to an
+		// outbound alias; the alias mapping belongs to the previous
+		// connection, so the real topic cannot be authorized on this one.
+		if tk.FixedHeader.Type == packets.Publish &&
+			cl.ops != nil && cl.ops.hooks != nil && cl.ops.hooks.Provides(OnACLCheck) &&
+			(tk.TopicName == "" || !cl.ops.hooks.OnACLCheck(cl, tk.TopicName, false)) {
+			if ok := cl.State.Inflight.Delete(tk.PacketID); ok {
+				cl.ops.hooks.OnQosDropped(cl, tk)
+				atomic.AddInt64(&cl.ops.info.Inflight, -1)
+			}
+			continue
+		}
+
 		if tk.FixedHeader.Type == packets.Publish {
 			tk.FixedHeader.Dup = true // [MQTT-3.3.1-1] [MQTT-3.3.1-3]
 		}

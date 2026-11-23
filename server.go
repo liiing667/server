@@ -856,12 +856,32 @@ func (s *Server) InjectPacket(cl *Client, pk packets.Packet) error {
 
 // processPublish processes a Publish packet.
 func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
-	if !cl.Net.Inline && !IsValidFilter(pk.TopicName, true) {
-		return nil
-	}
-
 	if atomic.LoadInt32(&cl.State.Inflight.receiveQuota) == 0 {
 		return s.DisconnectClient(cl, packets.ErrReceiveMaximum) // ~[MQTT-3.3.4-7] ~[MQTT-3.3.4-8]
+	}
+
+	// Resolve an inbound topic alias before authorization, so the write ACL,
+	// the OnPublish hooks, retention and fan-out all act on the real topic
+	// under the publishing connection's identity. A zero-length topic name is
+	// only legal when it refers to an alias already registered on this
+	// connection [MQTT-3.3.2-11]; an unknown alias is a protocol error
+	// [MQTT-3.3.2-12].
+	aliasPending := false
+	if !cl.Net.Inline && pk.Properties.TopicAliasFlag && pk.Properties.TopicAlias > 0 {
+		if pk.TopicName == "" {
+			topic, ok := cl.State.TopicAliases.Inbound.Get(pk.Properties.TopicAlias)
+			if !ok {
+				return packets.ErrTopicAliasInvalid
+			}
+			pk.TopicName = topic
+		} else {
+			// The mapping is only provisional until the publish is authorized.
+			aliasPending = true
+		}
+	}
+
+	if !cl.Net.Inline && !IsValidFilter(pk.TopicName, true) {
+		return nil
 	}
 
 	if !cl.Net.Inline && !s.hooks.OnACLCheck(cl, pk.TopicName, true) {
@@ -880,6 +900,11 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 
 		ack := s.buildAck(pk.PacketID, ackType, 0, pk.Properties, packets.ErrNotAuthorized)
 		return cl.WritePacket(ack)
+	}
+
+	// Authorization passed, so it is safe to bind or refresh the alias.
+	if aliasPending {
+		cl.State.TopicAliases.Inbound.Set(pk.Properties.TopicAlias, pk.TopicName)
 	}
 
 	pk.Origin = cl.ID
@@ -902,27 +927,29 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 		}
 	}
 
-	if pk.Properties.TopicAliasFlag && pk.Properties.TopicAlias > 0 { // [MQTT-3.3.2-11]
-		pk.TopicName = cl.State.TopicAliases.Inbound.Set(pk.Properties.TopicAlias, pk.TopicName)
-	}
-
 	if pk.FixedHeader.Qos > s.Options.Capabilities.MaximumQos {
 		pk.FixedHeader.Qos = s.Options.Capabilities.MaximumQos // [MQTT-3.2.2-9] Reduce qos based on server max qos capability
 	}
 
 	pkx, err := s.hooks.OnPublish(cl, pk)
-	if err == nil {
-		pk = pkx
-	} else if errors.Is(err, packets.ErrRejectPacket) {
-		return nil
-	} else if errors.Is(err, packets.CodeSuccessIgnore) {
-		pk.Ignore = true
-	} else if cl.Properties.ProtocolVersion == 5 && pk.FixedHeader.Qos > 0 && errors.As(err, new(packets.Code)) {
-		err = cl.WritePacket(s.buildAck(pk.PacketID, packets.Puback, 0, pk.Properties, err.(packets.Code)))
-		if err != nil {
-			return err
+	switch {
+	case err == nil:
+		// A hook may rewrite the topic. The write ACL was evaluated against
+		// the topic the client actually sent, so authorize the final topic
+		// too before it can be retained or delivered.
+		if pkx.TopicName != pk.TopicName && !cl.Net.Inline && !s.hooks.OnACLCheck(cl, pkx.TopicName, true) {
+			return s.rejectPublish(cl, pk, packets.ErrNotAuthorized)
 		}
+		pk = pkx
+	case errors.Is(err, packets.ErrRejectPacket):
 		return nil
+	case errors.Is(err, packets.CodeSuccessIgnore):
+		pk.Ignore = true
+	default:
+		// Any other error is a refusal, not a reason to continue. Falling
+		// through here would retain (or delete, for an empty payload) and
+		// deliver a message the hook refused.
+		return s.rejectPublish(cl, pk, err)
 	}
 
 	if pk.FixedHeader.Retain { // [MQTT-3.3.1-5] ![MQTT-3.3.1-8]
@@ -968,6 +995,27 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 	return nil
 }
 
+// rejectPublish finishes a publish which a hook refused. A v5 QoS 1/2 publish
+// is answered with the reason code the hook supplied; all other publishes are
+// dropped. It never touches the retained store.
+func (s *Server) rejectPublish(cl *Client, pk packets.Packet, err error) error {
+	var code packets.Code
+	if !errors.As(err, &code) {
+		return nil
+	}
+
+	if cl.Properties.ProtocolVersion != 5 || pk.FixedHeader.Qos == 0 {
+		return nil
+	}
+
+	ackType := packets.Puback
+	if pk.FixedHeader.Qos == 2 {
+		ackType = packets.Pubrec
+	}
+
+	return cl.WritePacket(s.buildAck(pk.PacketID, ackType, 0, pk.Properties, code))
+}
+
 // retainMessage adds a message to a topic, and if a persistent store is provided,
 // adds the message to the store to be reloaded if necessary.
 func (s *Server) retainMessage(cl *Client, pk packets.Packet) {
@@ -1002,7 +1050,7 @@ func (s *Server) publishToSubscribers(pk packets.Packet) {
 	if len(subscribers.Shared) > 0 {
 		subscribers = s.hooks.OnSelectSubscribers(subscribers, pk)
 		if len(subscribers.SharedSelected) == 0 {
-			subscribers.SelectShared()
+			subscribers.SelectSharedWith(s.sharedSelectionEligible(pk))
 		}
 		subscribers.MergeSharedSelected()
 	}
@@ -1021,15 +1069,48 @@ func (s *Server) publishToSubscribers(pk packets.Packet) {
 	}
 }
 
+// sharedSelectionEligible returns a predicate which applies the same no-local
+// and per-topic read checks used for delivery while a shared group's consumer
+// is being chosen. A candidate which may not read the actual topic is skipped,
+// so the group can fall through to another member instead of choosing an
+// identity which would be refused later.
+func (s *Server) sharedSelectionEligible(pk packets.Packet) func(client string, sub packets.Subscription) bool {
+	return func(client string, sub packets.Subscription) bool {
+		if sub.NoLocal && pk.Origin == client {
+			return false
+		}
+
+		cl, ok := s.Clients.Get(client)
+		if !ok || cl.Net.Conn == nil || cl.Closed() {
+			return false
+		}
+
+		return s.hooks.OnACLCheck(cl, pk.TopicName, false)
+	}
+}
+
 func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packets.Packet) (packets.Packet, error) {
 	if sub.NoLocal && pk.Origin == cl.ID {
 		return pk, nil // [MQTT-3.8.3-3]
 	}
 
-	out := pk.Copy(false)
 	if !s.hooks.OnACLCheck(cl, pk.TopicName, false) {
-		return out, packets.ErrNotAuthorized
+		return pk.Copy(false), packets.ErrNotAuthorized
 	}
+
+	return s.publishToClientAuthorized(cl, sub, pk)
+}
+
+// publishToClientAuthorized delivers a publish to a client whose read access
+// to pk.TopicName has already been established for that client. It is used by
+// callers which must make the decision against the actual topic before the
+// usual delivery transformations would hide it.
+func (s *Server) publishToClientAuthorized(cl *Client, sub packets.Subscription, pk packets.Packet) (packets.Packet, error) {
+	if sub.NoLocal && pk.Origin == cl.ID {
+		return pk, nil // [MQTT-3.8.3-3]
+	}
+
+	out := pk.Copy(false)
 	if !sub.FwdRetainedFlag && ((cl.Properties.ProtocolVersion == 5 && !sub.RetainAsPublished) || cl.Properties.ProtocolVersion < 5) { // ![MQTT-3.3.1-13] [v3 MQTT-3.3.1-9]
 		out.FixedHeader.Retain = false // [MQTT-3.3.1-12]
 	}
@@ -1124,7 +1205,22 @@ func (s *Server) publishRetainedToClient(cl *Client, sub packets.Subscription, e
 
 	sub.FwdRetainedFlag = true
 	for _, pkv := range s.Topics.Messages(sub.Filter) { // [MQTT-3.8.4-4]
-		_, err := s.publishToClient(cl, sub, pkv)
+		if sub.NoLocal && pkv.Origin == cl.ID {
+			continue // [MQTT-3.8.3-3]
+		}
+
+		// The subscription filter was authorized, but it may match topics the
+		// subscriber is not allowed to read. Check each retained message
+		// against its real topic, under the recipient's identity, before
+		// delivering it. A refusal only skips this message; the retained
+		// message itself stays in the store.
+		if !s.hooks.OnACLCheck(cl, pkv.TopicName, false) {
+			s.Log.Debug("retained message not authorized for client",
+				"client", cl.ID, "topic", pkv.TopicName, "listener", cl.Net.Listener)
+			continue
+		}
+
+		_, err := s.publishToClientAuthorized(cl, sub, pkv)
 		if err != nil {
 			s.Log.Debug("failed to publish retained message", "error", err, "client", cl.ID, "listener", cl.Net.Listener, "packet", pkv)
 			continue

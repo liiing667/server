@@ -5,6 +5,7 @@
 package mqtt
 
 import (
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -61,6 +62,14 @@ func (a *InboundTopicAliases) Set(id uint16, topic string) string {
 
 	a.internal[id] = topic
 	return topic
+}
+
+// Get returns the topic name registered for an inbound alias, if it exists.
+func (a *InboundTopicAliases) Get(id uint16) (topic string, ok bool) {
+	a.RLock()
+	defer a.RUnlock()
+	topic, ok = a.internal[id]
+	return
 }
 
 // OutboundTopicAliases contains a map of topic aliases sent from the broker to the client.
@@ -318,9 +327,32 @@ type Subscribers struct {
 
 // SelectShared returns one subscriber for each shared subscription group.
 func (s *Subscribers) SelectShared() {
+	s.SelectSharedWith(nil)
+}
+
+// SelectSharedWith returns one subscriber for each shared subscription filter,
+// skipping any candidate for which eligible returns false. If eligible is nil,
+// every candidate is eligible.
+//
+// The eligibility predicate is evaluated under each candidate's own identity
+// before that identity is selected. This keeps a shared group from choosing a
+// member which cannot read the actual topic, which would otherwise either leak
+// the message to that member or lose it for every other member of the group.
+func (s *Subscribers) SelectSharedWith(eligible func(client string, sub packets.Subscription) bool) {
 	s.SharedSelected = map[string]packets.Subscription{}
 	for _, subs := range s.Shared {
-		for client, sub := range subs {
+		clients := make([]string, 0, len(subs))
+		for client := range subs {
+			clients = append(clients, client)
+		}
+		sort.Strings(clients)
+
+		for _, client := range clients {
+			sub := subs[client]
+			if eligible != nil && !eligible(client, sub) {
+				continue
+			}
+
 			cls, ok := s.SharedSelected[client]
 			if !ok {
 				cls = sub
